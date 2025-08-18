@@ -1,5 +1,5 @@
 {
-  "name": "lash3z-full-scaffold",
+  "name": "lash3z-backend1",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -8,7 +8,9 @@
     "dev": "nodemon server.js",
     "start": "node server.js"
   },
-  "engines": { "node": "20.x" },
+  "engines": {
+    "node": "20.x"
+  },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "compression": "^1.8.1",
@@ -24,5 +26,9 @@
   },
   "devDependencies": {
     "nodemon": "^3.1.10"
-  }
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": ""
 }
