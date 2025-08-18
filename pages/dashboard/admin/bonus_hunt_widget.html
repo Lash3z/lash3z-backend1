@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Bonus Hunt — OBS Widget 600x600 (Compact Fill)</title>
+<style>
+  /* Transparent page for OBS */
+  html,body{margin:0;height:100%;background:transparent}
+
+  /* Fixed 600×600 stage */
+  .stage{width:600px;height:600px;display:grid;place-items:center;background:transparent}
+
+  /* Panel */
+  .widget{
+    width:500px;height:580px;padding:10px;
+    background:linear-gradient(180deg,#0c1419,#0a1116);
+    border:1px solid rgba(0,255,255,.25);
+    border-radius:16px; box-shadow:0 10px 32px rgba(0,0,0,.35), inset 0 0 24px rgba(0,255,255,.04);
+    color:#eaf7ff; font-family:Segoe UI,system-ui,-apple-system,Arial,sans-serif;
+    display:grid; grid-template-rows:auto auto 1fr auto; gap:8px;
+  }
+
+  .heading{display:flex;align-items:center;justify-content:space-between}
+  .title{font-weight:900;color:#7ffaff;text-shadow:0 0 12px rgba(0,255,255,.3)}
+  .stamp{font-size:12px;color:#9fd0d6}
+
+  /* Compact top chips */
+  .chips{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+  .chip{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:7px 9px;border:1px solid rgba(0,255,255,.16);border-radius:10px;
+    background:#0b1418;font-size:11.5px;line-height:1.05
+  }
+  .chip b{color:#cfffff}
+  .chip .v{font-weight:900}
+
+  /* Table (Provider removed) */
+  .tableWrap{
+    border:1px solid rgba(0,255,255,.16);border-radius:12px;overflow:hidden;background:#091117;
+    display:grid;grid-template-rows:auto 1fr; /* header + rows fill remaining space */
+    min-height:200px;
+  }
+  /* # | Slot | Bet | Result | Multi */
+  .thead,.trow{display:grid;grid-template-columns:28px 1.9fr .8fr .9fr .6fr;gap:6px}
+  .thead{
+    padding:7px 9px;font-size:11px;color:#9fd0d6;background:#0c1720;
+    border-bottom:1px solid rgba(255,255,255,.06)
+  }
+  .rows{position:relative;overflow:hidden;flex:1} /* height is set dynamically in JS */
+  .trow{
+    padding:5px 9px;height:32px;align-items:center;
+    border-bottom:1px solid rgba(255,255,255,.06);font-size:11.5px
+  }
+  .muti{font-weight:900}
+  .pos{color:#12d48a}.neg{color:#e25a6f}
+  .mono{font-variant-numeric:tabular-nums}
+
+  /* Bottom stats (TOTAL PAID + PROFIT) */
+  .footerStats{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  .foot{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:9px;border:1px solid rgba(0,255,255,.18);border-radius:10px;background:#0b1418;
+    font-size:13px;font-weight:700
+  }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="widget" id="app">
+    <div class="heading">
+      <div class="title">Bonus Hunt</div>
+      <div class="stamp" id="stamp">—</div>
+    </div>
+
+    <!-- chips -->
+    <div class="chips" id="chips"></div>
+
+    <!-- table -->
+    <div class="tableWrap" id="tableWrap">
+      <div class="thead" id="thead">
+        <div>#</div><div>Slot</div><div class="mono">Bet</div><div class="mono">Result</div><div>Multi</div>
+      </div>
+      <div class="rows" id="rows"></div>
+    </div>
+
+    <!-- bottom: Total Paid + Profit -->
+    <div class="footerStats">
+      <div class="foot"><span>TOTAL PAID</span><span class="mono" id="paid">$0.00</span></div>
+      <div class="foot"><span>PROFIT</span><span class="mono" id="profit">$0.00</span></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  const $=(s,r=document)=>r.querySelector(s);
+  const fmt$=n=>isFinite(n)?("$"+Number(n).toFixed(2)):"—";
+  const fmtX=n=>isFinite(n)?(Number(n).toFixed(1)+"x"):"—";
+  const sum=(a,f=Number)=>a.reduce((t,x)=>t+(+f(x)||0),0);
+  const mean=(a,f=Number)=>a.length?sum(a,f)/a.length:0;
+  function sget(k){try{const v=localStorage.getItem(k);return v?JSON.parse(v):null}catch{return null}}
+  function nowStamp(){const d=new Date();return d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"})}
+
+  function readBH(){
+    const live=sget('bh:live'); if(live?.entries) return live;
+    const draft=sget('bh:draft'); if(draft?.entries) return draft;
+    return {
+      start:400, opening:22,
+      entries:[
+        {slot:"Big Bass Bonanza", bet:0.40, payout:4.40, x:11.0},
+        {slot:"Hot Fiesta", bet:1.25, payout:248.35, x:198.7},
+        {slot:"Le Bandit", bet:0.20, payout:0.80, x:4.0},
+        {slot:"Book of Time", bet:0.20, payout:2.14, x:10.7},
+        {slot:"The Dog House", bet:0.40, payout:32.10, x:80.3},
+        {slot:"Book of Shadows", bet:0.20, payout:26.02, x:130.1},
+        {slot:"Duel at Dawn", bet:0.20, payout:8.18, x:40.9},
+        {slot:"Wanted Dead", bet:0.20, payout:5.20, x:26.0},
+        {slot:"Chaos Crew", bet:0.20, payout:1.20, x:6.0},
+        {slot:"Sweet Bonanza", bet:0.40, payout:14.80, x:37.0},
+        {slot:"Gates of Olympus", bet:0.40, payout:12.00, x:30.0},
+        {slot:"Hop N Pop", bet:0.20, payout:0.90, x:4.5}
+      ]
+    };
+  }
+
+  function compute(model){
+    const e=model.entries||[];
+    const played=e.filter(x=>x.payout!=null || x.done===true);
+    const totalCost=sum(played,x=>x.bet);
+    const totalPaid=sum(played,x=>x.payout);
+    const avgBet=mean(played,x=>x.bet);
+    const avgX=played.length?mean(played,x=>x.x || ((x.payout||0)/(x.bet||1))):0;
+    const beRemaining=Math.max(0,totalCost-totalPaid);
+    const bePerBonus=played.length?(totalCost/played.length):0;
+    const profit=(model.opening!=null?(totalPaid-totalCost+model.opening):(totalPaid-totalCost));
+    return {
+      count:played.length,start:+model.start||0,opening:+model.opening||0,
+      totalPaid,avgBet,avgX,beRemaining,bePerBonus,profit,
+      rows:played.map((x,i)=>({idx:i+1,slot:x.slot||"—",bet:+x.bet||0,payout:+x.payout||0,multi:(x.x!=null?+x.x:((+x.payout||0)/(+x.bet||1)))}))
+    };
+  }
+
+  function paintChips(s){
+    const chips=[
+      {k:'Bonuses',v:String(s.count)},
+      {k:'B/E REMAINING',v:fmt$(s.beRemaining)},
+      {k:'START → OPENING',v:`${fmt$(s.start)} → ${fmt$(s.opening)}`},
+      {k:'AVG BET',v:fmt$(s.avgBet)},
+      {k:'AVG X',v:fmtX(s.avgX)},
+      {k:'B/E PER BONUS',v:fmt$(s.bePerBonus)},
+    ];
+    const host=$('#chips'); host.innerHTML='';
+    chips.forEach(c=>{
+      const d=document.createElement('div');
+      d.className='chip'; d.innerHTML=`<b>${c.k}</b><span class="v mono">${c.v}</span>`;
+      host.appendChild(d);
+    });
+  }
+
+  let timer=null, phase=0;
+  function paintRows(rows){
+    const host=$('#rows'); host.innerHTML='';
+    const dup=rows.concat(rows);
+
+    dup.forEach(r=>{
+      const row=document.createElement('div');
+      row.className='trow';
+      row.innerHTML=`
+        <div>${r.idx}</div>
+        <div title="${r.slot}">${r.slot}</div>
+        <div class="mono">${fmt$(r.bet)}</div>
+        <div class="mono">${fmt$(r.payout)}</div>
+        <div class="muti ${r.multi>=100?'pos':''}">${fmtX(r.multi)}</div>`;
+      host.appendChild(row);
+    });
+
+    // Dynamically size the visible rows area to fill all remaining space
+    const wrap = $('#tableWrap');
+    const headH = $('#thead').offsetHeight || 0;
+    const avail = Math.max(160, wrap.clientHeight - headH); // fill, but keep a sensible minimum
+    host.style.height = avail + 'px';
+
+    // Calculate how many rows actually fit, then autoscroll only if needed
+    const rowH = 32;
+    const viewRows = Math.max(Math.floor(avail / rowH), 3);
+    if(timer) clearInterval(timer);
+    host.scrollTop=0; phase=0;
+
+    if(rows.length > viewRows){
+      timer=setInterval(()=>{
+        phase=(phase+1)%(rows.length);
+        host.scrollTo({top:rowH*phase,behavior:'smooth'});
+      }, 2200);
+    }
+  }
+
+  function paintFooter(s){
+    $('#stamp').textContent=nowStamp();
+    $('#paid').textContent=fmt$(s.totalPaid);
+    const pf=$('#profit');
+    pf.textContent=(s.profit<0?'-':'')+fmt$(Math.abs(s.profit));
+    pf.className='mono '+(s.profit>=0?'pos':'neg');
+  }
+
+  function boot(){
+    const model=readBH(), stats=compute(model);
+    paintChips(stats); paintRows(stats.rows); paintFooter(stats);
+  }
+
+  boot();
+  // Refresh from localStorage periodically (and resize rows if stage changes)
+  setInterval(boot,5000);
+  addEventListener('resize', boot);
+})();
+</script>
+</body>
+</html>

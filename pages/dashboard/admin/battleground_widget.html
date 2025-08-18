@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Battleground — Slim Widget</title>
+<meta http-equiv="Cache-Control" content="no-store"/>
+
+<style>
+  :root{
+    --ink:#eaf7ff; --muted:#9fd0d6; --teal:#00ffff; --line:rgba(0,255,255,.18);
+    --gold:#ffb42d;
+  }
+
+  html,body{
+    margin:0;height:100%;
+    background:#000 url("/assets/media/BG_page.png") center/cover fixed no-repeat;
+    color:var(--ink);font-family:Segoe UI,system-ui,Arial,sans-serif;
+    user-select:none;
+  }
+
+  .wrap{
+    width:max-content; margin:14px auto; padding:10px 12px;
+    background:linear-gradient(180deg,rgba(5,10,12,.72),rgba(5,10,12,.78));
+    border:1px solid var(--line); border-radius:14px; box-shadow:0 10px 34px rgba(0,0,0,.45);
+  }
+
+  .stage{position:relative; min-width:740px; min-height:126px; overflow:hidden}
+  .card{position:absolute; inset:0; display:grid; place-items:center; opacity:0; transform:translateY(14px); transition:opacity .35s ease, transform .35s ease}
+  .card.show{opacity:1; transform:translateY(0)}
+
+  .row{
+    display:grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap:18px; align-items:center;
+  }
+
+  /* LEFT: text → image (image close to scores) */
+  .side{
+    display:grid; grid-template-columns:1fr 76px; gap:12px; align-items:center;
+    cursor:pointer;
+  }
+  .side .text{ grid-column:1; text-align:left; }
+  .side .thumb{ grid-column:2; justify-self:start; }
+
+  /* RIGHT: image → text (image close to scores) */
+  .side.right{
+    grid-template-columns:76px 1fr;
+  }
+  .side.right .thumb{ grid-column:1; justify-self:end; }
+  .side.right .text{ grid-column:2; text-align:right; }
+
+  .thumb{width:76px;height:102px;border-radius:10px;border:1px solid var(--line);overflow:hidden;background:#000}
+  .thumb img{width:100%;height:100%;object-fit:cover;display:block}
+  .name{font-weight:900; font-size:22px}
+  .prov{font-size:12px; color:var(--muted); margin-top:2px}
+  .winner{color:var(--gold); filter:drop-shadow(0 0 5px #ffb42d77); margin-right:6px}
+
+  .mid{
+    display:grid; grid-template-columns:minmax(48px,auto) 52px minmax(48px,auto);
+    align-items:center; gap:6px;
+    cursor:default;
+  }
+  .vs{font-weight:900; text-align:center; color:#bff; text-shadow:0 0 10px rgba(0,255,255,.35)}
+  .score{
+    min-width:48px; text-align:center; font-weight:900; font-size:20px;
+    padding:6px 10px; border:1px solid var(--line); border-radius:10px; background:#0a1418;
+  }
+
+  .meta{margin-top:6px; text-align:center; font-size:12px; color:var(--muted)}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="stage">
+      <div id="card" class="card"><!-- runtime renders --></div>
+    </div>
+    <div id="meta" class="meta">0 / 0</div>
+  </div>
+
+<script>
+(function(){
+  "use strict";
+  const BKEY='bg:builder:battleground', GKEY='bg:games', MKEY='bg:matches', IDXK='bg:widget:mx_idx';
+  const $=s=>document.querySelector(s);
+  const cardEl=$('#card'), metaEl=$('#meta');
+
+  // ===== Query options =====
+  const params=new URLSearchParams(location.search);
+  const startIndex = parseInt(params.get('index') ?? params.get('i') ?? '', 10);
+  const autoNext   = (params.get('autonext') ?? '1') !== '0';
+  const bgOverride = params.get('bg');
+  if (bgOverride) {
+    document.documentElement.style.backgroundImage = `url("${encodeURI(bgOverride)}")`;
+    document.documentElement.style.backgroundPosition = 'center';
+    document.documentElement.style.backgroundSize = 'cover';
+    document.documentElement.style.backgroundAttachment = 'fixed';
+  }
+
+  // ===== Image resolver (title → /assets/slot_images/xxxx.png) =====
+  const IMG_BASES=['assets/slot_images/','../assets/slot_images/','/assets/slot_images/'];
+  const IMG_EXT=['png','webp','jpg','jpeg']; // prefer PNG
+  let IMG_INDEX=null;
+  const IMG_CACHE=new Map(); // key -> url or ''
+
+  // normalize any old "slot images/" paths to "slot_images/"
+  const fixPath = (u)=> typeof u==='string' ? u.replace(/slot images\//g,'slot_images/') : u;
+
+  function slug(s){ return String(s||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,''); }
+  function imgExists(url){
+    return new Promise(res=>{
+      const i=new Image(); i.onload=()=>res(true); i.onerror=()=>res(false);
+      i.src = encodeURI(url) + (url.includes('?')?'&':'?') + 'v=' + Date.now();
+    });
+  }
+  async function loadIndex(){
+    if(IMG_INDEX!==null) return IMG_INDEX;
+    for(const b of IMG_BASES){
+      try{
+        const r=await fetch(encodeURI(b+'index.json'),{cache:'no-store'});
+        if(r.ok){
+          const j=await r.json();
+          IMG_INDEX = Array.isArray(j) ? j : (Array.isArray(j.images) ? j.images : Object.values(j||{}));
+          return IMG_INDEX;
+        }
+      }catch(_){}
+    }
+    IMG_INDEX=[];
+    return IMG_INDEX;
+  }
+  async function resolveByTitle(title, provider){
+    const key=String(title||'').toUpperCase();
+    if(IMG_CACHE.has(key)) return IMG_CACHE.get(key);
+    await loadIndex();
+    const tSlug=slug(title||''), pSlug=slug(provider||'');
+
+    // 1) index.json
+    if(IMG_INDEX && IMG_INDEX.length){
+      const hits=IMG_INDEX.filter(e=> typeof e==='string' && e.toLowerCase().includes(tSlug) && (!pSlug || e.toLowerCase().includes(pSlug)));
+      for(const ent of hits){
+        const tries = (/^(?:\/|\.{1,2}\/|assets\/)/.test(ent)) ? [ent] : IMG_BASES.map(b=>b+ent);
+        for(const u of tries){ if(await imgExists(u)){ IMG_CACHE.set(key,fixPath(u)); return fixPath(u); } }
+      }
+    }
+    // 2) filename guesses
+    const guesses=[];
+    for(const base of IMG_BASES){
+      IMG_EXT.forEach(ext=>guesses.push(`${base}${title}.${ext}`));
+      IMG_EXT.forEach(ext=>guesses.push(`${base}${(title||'').toLowerCase()}.${ext}`));
+      IMG_EXT.forEach(ext=>guesses.push(`${base}${tSlug}.${ext}`));
+      if(pSlug){
+        IMG_EXT.forEach(ext=>guesses.push(`${base}${pSlug}__${tSlug}.${ext}`));
+        IMG_EXT.forEach(ext=>guesses.push(`${base}${pSlug}/${tSlug}.${ext}`));
+      }
+    }
+    for(const u of guesses){ if(await imgExists(u)){ IMG_CACHE.set(key,fixPath(u)); return fixPath(u); } }
+    IMG_CACHE.set(key,''); return '';
+  }
+
+  // ===== State =====
+  let data=readBuilder(), idx=readIdx(), lastHash='';
+
+  function readIdx(){
+    if (Number.isFinite(startIndex) && startIndex >= 0) return startIndex|0;
+    const n=Number(localStorage.getItem(IDXK));
+    return Number.isFinite(n)&&n>=0?n:0;
+  }
+  function saveIdx(i){ localStorage.setItem(IDXK,String(i)); }
+  function sget(k,def=null){ try{const v=localStorage.getItem(k); return v?JSON.parse(v):def;}catch{return def;} }
+  function readBuilder(){
+    const b=sget(BKEY,null);
+    if (b && b.matches && b.games) return b;
+    const games=sget(GKEY,[]); const matches=sget(MKEY,[]);
+    return {games,matches,lastUpdated:Date.now()};
+  }
+  function hash(o){ try{return JSON.stringify(o);}catch{return '';} }
+  function clamp(){
+    const len = data.matches?.length||0;
+    if(!len){ idx=0; return; }
+    if(idx>=len) idx=len-1;
+    if(idx<0) idx=0;
+  }
+  function firstUnfinished(){
+    if(!data.matches) return 0;
+    const i=data.matches.findIndex(m=>!m.winnerId);
+    return i===-1 ? Math.max(0, data.matches.length-1) : i;
+  }
+  function nextUnfinished(i){
+    if(!data.matches?.length) return 0;
+    for(let k=i+1;k<data.matches.length;k++) if(!data.matches[k].winnerId) return k;
+    return Math.max(0, data.matches.length-1);
+  }
+  function enc(u){ return encodeURI(String(u||'')); }
+  function esc(s){
+    s = String(s ?? '');
+    return s.replace(/[&<>"']/g, m => (
+      m==='&'?'&amp;': m==='<'?'&lt;': m==='>'?'&gt;': m==='"'?'&quot;':'&#39;'
+    ));
+  }
+  function fmtTime(ts){
+    if(!ts) return '';
+    try{ return new Date(ts).toLocaleString(); }catch{ return ''; }
+  }
+  function preload(imgUrl){
+    if(!imgUrl) return;
+    const i=new Image(); i.src = enc(fixPath(imgUrl));
+  }
+
+  async function backfillImages(){
+    if(!Array.isArray(data.matches)||!data.matches.length) return;
+    const gmap=new Map((data.games||[]).map(g=>[g.id,g]));
+    let changed=false;
+    for(const mx of data.matches){
+      const L=gmap.get(mx.leftId)||{}, R=gmap.get(mx.rightId)||{};
+      if(!mx.leftImg){
+        const u=await resolveByTitle(mx.leftTitle||L.title||'LEFT', L.provider||'');
+        if(u){ mx.leftImg=fixPath(u); changed=true; }
+      }else{
+        mx.leftImg = fixPath(mx.leftImg);
+      }
+      if(!mx.rightImg){
+        const u=await resolveByTitle(mx.rightTitle||R.title||'RIGHT', R.provider||'');
+        if(u){ mx.rightImg=fixPath(u); changed=true; }
+      }else{
+        mx.rightImg = fixPath(mx.rightImg);
+      }
+    }
+    if(changed){
+      try{ localStorage.setItem(BKEY, JSON.stringify(data)); }catch(_){}
+    }
+  }
+
+  // ===== Render =====
+  function render(){
+    clamp();
+    const total = data.matches?.length||0;
+    metaEl.textContent = total ? `${idx+1} / ${total} • Updated ${fmtTime(data.lastUpdated||0)}` : '0 / 0';
+
+    const mx=data.matches?.[idx];
+    if(!mx){ cardEl.innerHTML='<div class="meta">No matchups published.</div>'; return; }
+
+    const map=new Map((data.games||[]).map(g=>[g.id,g]));
+    const L=map.get(mx.leftId)||{}, R=map.get(mx.rightId)||{};
+    const leftWin=mx.winnerId && mx.winnerId===mx.leftId;
+    const rightWin=mx.winnerId && mx.winnerId===mx.rightId;
+
+    const lTitle=mx.leftTitle||L.title||'LEFT', rTitle=mx.rightTitle||R.title||'RIGHT';
+    const lProv=L.provider||'', rProv=R.provider||'';
+    const lImg=fixPath(mx.leftImg||L.imageUrl||L.image||''), rImg=fixPath(mx.rightImg||R.imageUrl||R.image||'');
+    const sL=Number(mx.leftScore||0), sR=Number(mx.rightScore||0);
+
+    // Preload next images
+    const next = Math.min(idx+1, Math.max(0,(data.matches?.length||1)-1));
+    const nm = data.matches?.[next];
+    if(nm){
+      const nL=(map.get(nm.leftId)||{}), nR=(map.get(nm.rightId)||{});
+      preload(nm.leftImg||nL.imageUrl||nL.image||'');
+      preload(nm.rightImg||nR.imageUrl||nR.image||'');
+    }
+
+    cardEl.classList.remove('show');
+    cardEl.innerHTML = `
+      <div class="row">
+        <!-- LEFT: text then image -->
+        <div class="side" id="goPrev" style="justify-self:end">
+          <div class="text">
+            <div class="name">${leftWin?'<span class="winner">🏆</span>':''}${esc(lTitle)}</div>
+            <div class="prov">${esc(lProv)}</div>
+          </div>
+          <div class="thumb">${lImg?`<img src="${enc(lImg)}" alt="">`:''}</div>
+        </div>
+
+        <div class="mid">
+          <div class="score">${sL}</div>
+          <div class="vs">VS</div>
+          <div class="score">${sR}</div>
+        </div>
+
+        <!-- RIGHT: image then text -->
+        <div class="side right" id="goNext">
+          <div class="thumb">${rImg?`<img src="${enc(rImg)}" alt="">`:''}</div>
+          <div class="text">
+            <div class="name">${rightWin?'<span class="winner">🏆</span>':''}${esc(rTitle)}</div>
+            <div class="prov">${esc(rProv)}</div>
+          </div>
+        </div>
+      </div>
+    `;
+    requestAnimationFrame(()=>cardEl.classList.add('show'));
+
+    const prevBtn = document.getElementById('goPrev');
+    const nextBtn = document.getElementById('goNext');
+    if(prevBtn) prevBtn.onclick = ()=> go(idx-1, true);
+    if(nextBtn) nextBtn.onclick = ()=> go(idx+1, true);
+
+    if(autoNext && mx.winnerId){
+      const jump = nextUnfinished(idx);
+      if(jump!==idx) setTimeout(()=>go(jump,true), 1500);
+    }
+  }
+
+  function go(i,animate){
+    const len = data.matches?.length||0;
+    if(!len) return;
+    if(i<0) i=len-1; else if(i>=len) i=0;
+    if(i===idx) return;
+    idx=i; saveIdx(idx);
+    if(animate){ cardEl.classList.remove('show'); setTimeout(render,160); }
+    else render();
+  }
+
+  async function tick(){
+    const now=readBuilder(); const h=hash(now);
+    if(h!==lastHash){
+      data=now;
+      await backfillImages();
+      if(idx >= (data.matches?.length||0)) idx=firstUnfinished();
+      lastHash=h;
+      render();
+    }
+  }
+
+  window.addEventListener('storage', e=>{ if([BKEY,GKEY,MKEY].includes(e.key)) tick(); });
+  setInterval(tick, 800);
+
+  window.addEventListener('keydown', e=>{
+    if(e.key==='ArrowRight') go(idx+1,true);
+    else if(e.key==='ArrowLeft') go(idx-1,true);
+    else if(e.key==='Home') go(0,true);
+    else if(e.key==='End') go((data.matches?.length||1)-1,true);
+    else if(e.key.toLowerCase()==='u') go(firstUnfinished(),true);
+  });
+
+  // init
+  data=readBuilder();
+  backfillImages();
+  if(!Number.isFinite(startIndex)) {
+    if(!localStorage.getItem(IDXK)) idx=firstUnfinished();
+  }
+  saveIdx(idx);
+  lastHash=hash(data);
+  render();
+})();
+</script>
+</body>
+</html>

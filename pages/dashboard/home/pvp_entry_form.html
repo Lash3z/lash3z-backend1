@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>PVP — Entry Form</title>
+<meta http-equiv="Cache-Control" content="no-store"/>
+<style>
+  :root{--bg:#060b0d;--ink:#eaf7ff;--muted:#a8c6cc;--line:rgba(0,255,255,.18);--teal:#00ffff;--ok:#11d48a;--bad:#ff6b81}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#000 url("/assets/BG_page.png") center/cover fixed no-repeat;color:var(--ink);font-family:Segoe UI,system-ui,Arial,sans-serif}
+  .wrap{max-width:560px;margin:28px auto;padding:0 16px}
+  h1{margin:0 0 6px;color:var(--teal);text-shadow:0 0 16px #00ffff55}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:14px}
+  .card{border:1px solid var(--line);border-radius:14px;background:#0d1417;padding:16px}
+  label{display:block;margin:10px 0 6px;font-size:14px;color:#cfe}
+  input,select,button{width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:#0b1215;color:var(--ink);outline:none}
+  button{background:#00ffff;color:#001316;font-weight:800;cursor:pointer;box-shadow:0 0 18px #00ffff44;margin-top:10px}
+  button[disabled]{opacity:.6;cursor:not-allowed}
+  .row{display:flex;gap:10px;align-items:center}
+  .pill{padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:#081318;color:#cff;font-size:12px}
+  .status{min-height:18px;margin-top:10px;font-size:13px}
+  .ok{color:var(--ok)} .bad{color:var(--bad)}
+  .imgprev{width:48px;height:48px;border-radius:10px;object-fit:cover;border:1px solid rgba(255,255,255,.12);background:#061015}
+</style>
+</head>
+
+<body>
+<div class="wrap">
+  <div class="row" style="justify-content:space-between;margin-bottom:10px">
+    <h1>PVP — Entry Form</h1>
+    <span id="env" class="pill">—</span>
+  </div>
+  <p class="sub">Enter to play a head-to-head match. Your entry goes to the admin inbox. Images are auto from <code>/assets/slot_images/&lt;game&gt;.png</code> with fallback to <code>mateslots_logo.png</code>.</p>
+
+  <div class="card">
+    <label>Username</label>
+    <input id="username" placeholder="Type your username" autocomplete="username"/>
+
+    <label style="margin-top:12px">Game</label>
+    <div class="row">
+      <img id="gPrev" class="imgprev" alt="">
+      <input id="game" placeholder="e.g. rip city, gates of olympus" autocomplete="off"/>
+    </div>
+
+    <label style="margin-top:12px">Side (optional)</label>
+    <select id="side">
+      <option value="">No preference</option>
+      <option value="EAST">EAST</option>
+      <option value="WEST">WEST</option>
+    </select>
+
+    <button id="submitBtn" type="button">Submit Entry</button>
+    <div id="msg" class="status"></div>
+    <div class="row" style="margin-top:10px">
+      <span class="pill" id="gate">Checking gate…</span>
+      <span class="pill" id="stamp">—</span>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===== Route /api to Node server when opened via Live Server (5501) ===== */
+(function(){
+  const API_BASE = (location.port === '5501') ? 'http://127.0.0.1:3000' : '';
+  const _fetch = window.fetch.bind(window);
+  window.fetch = (input, init={})=>{
+    if (typeof input === 'string' && input.startsWith('/api/')) {
+      input = API_BASE + input;
+      init = Object.assign({credentials:'include'}, init||{});
+    }
+    return _fetch(input, init);
+  };
+})();
+
+/* ===== helpers ===== */
+const $ = s => document.querySelector(s);
+const sget=(k,d=null)=>{ try{const v=localStorage.getItem(k);return v?JSON.parse(v):d;}catch(_){return d;} };
+const sset=(k,v)=>{ try{localStorage.setItem(k,JSON.stringify(v));}catch(_){ } };
+const up = s => String(s||'').trim().toUpperCase();
+
+/* Slot image guessing: /assets/slot_images/<slug>.png → fallback mateslots_logo.png */
+function slotImgFrom(title){
+  const DEF = "/assets/slot_images/mateslots_logo.png";
+  if(!title) return DEF;
+  const special = {"rip city":"rip_city","gates of olympus":"gates_of_olympus","gates":"gates_of_olympus","starlight princess":"starlight_princess","sweet bonanza":"sweet_bonanza"};
+  let s = String(title).trim().toLowerCase();
+  if (special[s]) s = special[s];
+  s = s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/&/g,'and').replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'');
+  return `/assets/slot_images/${s || 'mateslots_logo'}.png`;
+}
+
+/* ===== constants / state ===== */
+const INBOX_KEY = "pv:entries:inbox"; // Admin reads this when offline
+const msg  = $("#msg"), btn=$("#submitBtn"), gPrev=$("#gPrev");
+
+function setMsg(t, ok){ msg.textContent=t||""; msg.className="status "+(ok===true?"ok":ok===false?"bad":""); }
+function setGate(open){ $("#gate").textContent = open ? "Entry Form Enabled" : "Entries Closed"; }
+
+/* preview */
+function previewHook(){
+  const g = $("#game");
+  const upd = () => { gPrev.src = slotImgFrom(g.value); gPrev.onerror = () => gPrev.src="/assets/slot_images/mateslots_logo.png"; };
+  g.addEventListener('input', upd); upd();
+}
+
+/* queue into localStorage (used by Admin inbox when offline) */
+function pushLocalInbox(entry){
+  const inbox = sget(INBOX_KEY, []);
+  // keep 1 per username; replace older
+  const U = up(entry.username);
+  const kept = inbox.filter(e => up(e.username)!==U);
+  kept.push(entry);
+  sset(INBOX_KEY, kept);
+  try{ localStorage.setItem('pv:lastInboxUpdate', String(Date.now())); }catch(_){}
+}
+
+/* gate status */
+async function pollGate(){
+  try{
+    const r = await fetch('/api/pvp/entries/open', {cache:'no-store'});
+    if (!r.ok) throw 0;
+    const j = await r.json();
+    const open = !!(j && j.open);
+    setGate(open);
+    btn.disabled = !open;
+  }catch{
+    // if offline or API missing, leave it open for local/offline entries
+    setGate(true);
+    btn.disabled = false;
+  }
+}
+
+/* submit */
+async function submit(){
+  const username = up($("#username").value);
+  const game     = String($("#game").value||'').trim();
+  const side     = String($("#side").value||'').trim().toUpperCase();
+
+  if (!username) { setMsg("Please enter a username.", false); return; }
+  if (!game)     { setMsg("Please enter a game.", false); return; }
+
+  btn.disabled = true; setMsg("Submitting…");
+
+  const entry = { id: "pv_"+Date.now().toString(36), username, game, side, ts: Date.now() };
+
+  // Always write to local inbox so Admin can see it even offline
+  pushLocalInbox(entry);
+
+  // Try to send to server (best effort)
+  try{
+    const r = await fetch('/api/pvp/entries', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ username, game, side })
+    });
+    if (!r.ok) {
+      // bubble up clear message if entries are closed
+      const txt = await r.text().catch(()=> "");
+      throw new Error(txt || ("HTTP "+r.status));
+    }
+    setMsg("Entry submitted ✔", true);
+  }catch(e){
+    // still okay: we kept it locally
+    setMsg("Saved locally (offline). Admin will see it.", true);
+  }finally{
+    $("#stamp").textContent = "Last submit @ " + new Date().toLocaleTimeString();
+    btn.disabled = false;
+  }
+}
+
+/* init */
+(function start(){
+  try{ $("#env").textContent = location.origin; }catch(_){}
+  previewHook();
+  pollGate(); setInterval(pollGate, 10000);
+  $("#submitBtn").addEventListener('click', submit);
+
+  // remember last used values
+  const last = sget("pv:lastForm");
+  if (last){ $("#username").value=last.username||''; $("#game").value=last.game||''; $("#side").value=last.side||''; }
+  ["username","game","side"].forEach(id=>{
+    $("#"+id).addEventListener('input', ()=>{
+      sset("pv:lastForm", { username: $("#username").value, game: $("#game").value, side: $("#side").value });
+    });
+  });
+})();
+</script>
+</body>
+</html>

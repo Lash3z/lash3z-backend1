@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Admin Login — L3Z</title>
+<meta http-equiv="Cache-Control" content="no-store"/>
+<style>
+  :root{--bg:#060b0d;--ink:#eaf7ff;--muted:#a8c6cc;--line:rgba(0,255,255,.18);--teal:#00ffff;--ok:#11d48a;--bad:#ff6b81}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#000 url("/assets/BG_page.png") center/cover fixed no-repeat;color:var(--ink);font-family:Segoe UI,system-ui,Arial,sans-serif}
+  .wrap{min-height:100%;display:grid;place-items:center;padding:24px}
+  .card{width:380px;max-width:92vw;background:linear-gradient(180deg,rgba(5,10,12,.78),rgba(5,10,12,.50));
+        border:1px solid var(--line);border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.5);padding:20px}
+  h1{margin:0 0 8px;color:var(--teal);text-shadow:0 0 16px #00ffff55}
+  .muted{margin:0 0 16px;color:var(--muted);font-size:13px}
+  label{display:block;margin:12px 0 8px;font-size:14px}
+  input{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:#081216;color:var(--ink);outline:none}
+  button{width:100%;padding:12px;border:0;border-radius:10px;background:var(--teal);color:#001316;font-weight:800;cursor:pointer;box-shadow:0 0 20px #00ffff55;margin-top:12px}
+  button[disabled]{opacity:.6;cursor:not-allowed}
+  .row{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-top:8px}
+  .pill{padding:4px 8px;border:1px solid var(--line);border-radius:999px;background:#081318;color:#cff;font-size:12px}
+  #msg{min-height:18px;margin-top:10px;font-size:13px}
+  #msg.ok{color:var(--ok)} #msg.bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="row">
+      <h1 style="margin:0">Admin Login</h1>
+      <span id="env" class="pill">—</span>
+    </div>
+    <p class="muted">Server-locked. Your admin cookie is required.</p>
+
+    <form id="f" autocomplete="on">
+      <label>Username
+        <input name="username" required autocomplete="username"/>
+      </label>
+      <label>Password
+        <input name="password" type="password" required autocomplete="current-password"/>
+      </label>
+      <button id="submitBtn" type="submit">Unlock Admin</button>
+      <div id="msg"></div>
+    </form>
+  </div>
+</div>
+
+<!-- minimal helper (only if /assets/js/api-base.js not included elsewhere) -->
+<script>
+(function(){
+  if (window.api && typeof window.api.post==="function") return;
+  function isJson(r){return (r.headers.get("content-type")||"").indexOf("application/json")>-1;}
+  function core(path,opts){opts=opts||{};return fetch(path,{credentials:"include",headers:opts.headers||{},method:opts.method||"GET",body:opts.body}).then(function(r){
+    return (isJson(r)?r.json():r.text()).catch(function(){return null;}).then(function(b){
+      if(!r.ok||(b&&b.ok===false)){var e=new Error((b&&b.error)||("HTTP "+r.status));e.status=r.status;e.body=b;throw e;}
+      return b==null?{ok:true}:b;
+    });
+  });}
+  window.api={ post:function(p,b,o){o=o||{};o.method="POST";o.headers=Object.assign({"Content-Type":"application/json"},o.headers||{});o.body=JSON.stringify(b||{});return core(p,o); } };
+})();
+</script>
+
+<script>
+(function(){
+  "use strict";
+  var f = document.getElementById("f");
+  var msg = document.getElementById("msg");
+  var btn = document.getElementById("submitBtn");
+  var env = document.getElementById("env");
+
+  // show where we're posting (useful in dev)
+  try{ env.textContent = location.origin; }catch(_){ env.textContent = "—"; }
+
+  function setMsg(t, ok){
+    msg.textContent = t || "";
+    msg.className = ok===true ? "ok" : ok===false ? "bad" : "";
+    msg.id = "msg " + (ok===true?"ok":ok===false?"bad":"");
+  }
+
+  f.addEventListener("submit", function(e){
+    e.preventDefault();
+    var fd = new FormData(f);
+    var username = (fd.get("username")||"").toString().trim();
+    var password = (fd.get("password")||"").toString();
+    if(!username || !password){ setMsg("Enter username and password.", false); return; }
+
+    btn.disabled = true; setMsg("Unlocking…");
+
+    api.post("/api/admin/gate/login", { username: username, password: password })
+      .then(function(j){
+        setMsg("OK — redirecting…", true);
+        // redirect back to target or Admin Hub
+        var params = new URLSearchParams(location.search);
+        var next = params.get("redirect") || "/pages/dashboard/admin/admin_hub.html";
+        setTimeout(function(){ location.replace(next); }, 150);
+      })
+      .catch(function(e){
+        if (e && e.status === 405) setMsg("Login endpoint not enabled (405). Check backend route.", false);
+        else if (e && e.status === 404) setMsg("Login endpoint not found (404). Check API path.", false);
+        else setMsg((e && (e.body && e.body.error || e.message)) || "Login failed.", false);
+        btn.disabled = false;
+      });
+  });
+})();
+</script>
+</body>
+</html>

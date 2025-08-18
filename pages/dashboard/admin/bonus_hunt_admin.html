@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Bonus Hunt — Admin / Logger</title>
+<style>
+:root{--bg:#0b0f12;--panel:#0b1417;--ink:#eaf7ff;--muted:#9fd0d6;--line:rgba(0,255,255,.18);--teal:#00ffff;--ok:#12d48a;--bad:#e25a6f}
+*{box-sizing:border-box}
+html,body{margin:0;background:#000 url("") center/cover fixed no-repeat;color:var(--ink);font-family:"Segoe UI",system-ui,Arial,sans-serif}
+.wrap{max-width:1280px;margin:0 auto;padding:16px 16px 96px}
+h1{margin:0 0 12px;color:var(--teal);text-shadow:0 0 14px rgba(0,255,255,.33)}
+.card{background:linear-gradient(180deg,#0a1418,#0a1216);border:1px solid var(--line);border-radius:14px;padding:12px;margin-top:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.right{margin-left:auto}
+.btn{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#0f1720;color:#eaf7ff;font-weight:800;cursor:pointer}
+.btn.ok{background:#103d30;border-color:#1fa37b}
+.btn.warn{background:#231b0f;border-color:#8c6926}
+.btn.danger{background:#2b1116;border-color:#7e2a3c}
+.btn[disabled]{opacity:.5;cursor:not-allowed}
+.pill{padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:#081318;color:#cfffff}
+.small{font-size:12px;color:var(--muted)}
+input,select,textarea{border-radius:10px;border:1px solid var(--line);background:#0c1519;color:#eaf7ff;padding:10px}
+input[type="number"]{width:120px}
+.tbl{width:100%;border-collapse:separate;border-spacing:0}
+.tbl th,.tbl td{border-bottom:1px solid rgba(255,255,255,.06);padding:8px;text-align:left;font-size:13px;vertical-align:top}
+.tbl th{color:var(--muted)}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.statBox{border:1px solid var(--line);border-radius:12px;background:#0b1418;padding:12px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px}
+.kv b{color:#cfe}
+.bad{color:#ffbbc7}
+.good{color:#b8ffd9}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Bonus Hunt — Admin / Logger</h1>
+
+  <!-- Controls -->
+  <div class="card row" style="justify-content:space-between">
+    <div class="row">
+      <button id="btnAdd" class="btn ok">+ Add Game</button>
+      <button id="btnAutoX" class="btn">Auto-calc X</button>
+      <button id="btnSave" class="btn">Save (local)</button>
+      <button id="btnLoad" class="btn">Load (local)</button>
+      <button id="btnExport" class="btn">Export CSV</button>
+      <button id="btnImport" class="btn">Import</button>
+      <button id="btnPublish" class="btn warn">Publish to Live</button>
+      <button id="btnReset" class="btn danger">Reset</button>
+    </div>
+    <div class="row">
+      <span class="pill">Session:</span>
+      <input id="casino" placeholder="Casino / Session name or ID" style="min-width:220px">
+      <span class="pill">Start</span><input id="startBal" type="number" step="0.01" placeholder="0.00">
+      <span class="pill">Opening</span><input id="openBal"  type="number" step="0.01" placeholder="0.00">
+      <span id="stamp" class="pill">Not published</span>
+      <span id="msg" class="pill">Ready</span>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="statBox">
+      <div class="kv">
+        <b>Casino:</b>            <span id="sCasino">—</span>
+        <b>Bonuses:</b>           <span id="sBonuses">0</span>
+        <b>Start Balance:</b>     <span id="sStart">$0.00</span>
+        <b>Opening Balance:</b>   <span id="sOpening">$0.00</span>
+        <b>Total Cost:</b>        <span id="sCost">$0.00</span>
+        <b>Break-Even (remain):</b><span id="sBE">$0.00</span>
+        <b>Break-Even/B:</b>      <span id="sBEB">$0.00</span>
+        <b>Break-Even/X/B:</b>    <span id="sBEXB">0</span>
+      </div>
+    </div>
+    <div class="statBox">
+      <div class="kv">
+        <b>Avg. Betsize:</b>      <span id="sAvgBet">$0.00</span>
+        <b>Avg. Win:</b>          <span id="sAvgWin">$0.00</span>
+        <b>Avg. X:</b>            <span id="sAvgX">0</span>
+        <b>Total Bet (info):</b>  <span id="sTotBet">$0.00</span>
+        <b>Total Payout:</b>      <span id="sTotPay">$0.00</span>
+        <b>Total Profit:</b>      <span id="sProfit" class="bad">$0.00</span>
+        <b>100x Count:</b>        <span id="s100x">0</span>
+        <b>Last Updated:</b>      <span id="sTime">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Table -->
+  <div class="card">
+    <table class="tbl" id="tbl">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Slot</th>
+          <th>Provider</th>
+          <th>Bet</th>
+          <th>Result</th>
+          <th>Multi</th>
+          <th>When</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="small" style="margin-top:6px">Tip: enter Bet now; when you later add a Result we’ll auto-fill Multi (X) = Result ÷ Bet.</div>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  // ---------- helpers ----------
+  const $=(s,r=document)=>r.querySelector(s);
+  const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));
+  const sget=k=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):null}catch{return null}};
+  const sset=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
+  const kid=(p="ID")=>(p+Math.random().toString(36).slice(2,10).toUpperCase());
+  const fmt=(n,dec=2)=>Number(n||0).toFixed(dec);
+  const money=v=>'$'+fmt(v);
+  const now=()=>Date.now();
+  const toast=(t,ok=true)=>{const m=$("#msg");m.textContent=t;m.style.color=ok?"#baffea":"#ff9aa7";setTimeout(()=>m.textContent="Ready",1600);};
+
+  // ---------- storage keys ----------
+  const K_WORK="bh:logger:v2";
+  const K_DRAFT="bh:draft";
+  const K_LIVE ="bh:live";
+
+  // ---------- state ----------
+  let state = sget(K_WORK) || {meta:{casino:"",start:0,opening:0}, entries:[], lastUpdated:0};
+
+  // ---------- elements ----------
+  const tbody=$("#tbody");
+  const casinoInp=$("#casino"), startInp=$("#startBal"), openInp=$("#openBal"), stamp=$("#stamp");
+
+  // stats els
+  const sCasino=$("#sCasino"), sBonuses=$("#sBonuses"), sStart=$("#sStart"), sOpening=$("#sOpening"),
+        sCost=$("#sCost"), sBE=$("#sBE"), sBEB=$("#sBEB"), sBEXB=$("#sBEXB"),
+        sAvgBet=$("#sAvgBet"), sAvgWin=$("#sAvgWin"), sAvgX=$("#sAvgX"),
+        sTotBet=$("#sTotBet"), sTotPay=$("#sTotPay"), sProfit=$("#sProfit"),
+        s100x=$("#s100x"), sTime=$("#sTime");
+
+  // ---------- painting ----------
+  function paint(){
+    // header inputs
+    casinoInp.value = state.meta.casino||"";
+    startInp.value  = state.meta.start ?? "";
+    openInp.value   = state.meta.opening ?? "";
+
+    tbody.innerHTML="";
+    if(!state.entries.length){
+      const tr=document.createElement("tr");
+      tr.innerHTML='<td colspan="8" class="small">No games yet. Click “+ Add Game”.</td>';
+      tbody.appendChild(tr);
+    }else{
+      state.entries.forEach((e,idx)=>{
+        const tr=document.createElement("tr");
+        tr.innerHTML =
+          `<td>${idx+1}</td>
+           <td><input data-k="slot"     value="${e.slot||""}" placeholder="Game name" style="min-width:220px"></td>
+           <td><input data-k="provider" value="${e.provider||""}" placeholder="Provider"  style="min-width:160px"></td>
+           <td><input data-k="bet"   type="number" step="0.01" value="${e.bet??""}"     placeholder="0.00"></td>
+           <td><input data-k="payout"type="number" step="0.01" value="${e.payout??""}"  placeholder="0.00"></td>
+           <td><input data-k="x"     type="number" step="0.01" value="${e.x??""}"       placeholder="auto" title="Result ÷ Bet"></td>
+           <td class="small">${e.ts?new Date(e.ts).toLocaleString():"—"}</td>
+           <td><button class="btn" data-act="dup">Dup</button> <button class="btn danger" data-act="del">Del</button></td>`;
+        tr.querySelectorAll("input").forEach(inp=>{
+          inp.addEventListener("change",()=>{
+            const k=inp.dataset.k;
+            let v=inp.value;
+            if(k==="bet"||k==="payout"||k==="x"){ v=(v===""?null:+v); }
+            state.entries[idx][k]=v;
+            if((k==="bet"||k==="payout")){
+              const b=+state.entries[idx].bet||0, p=+state.entries[idx].payout||0;
+              if(b>0 && (p||p===0)){ state.entries[idx].x = +(p/b).toFixed(2); }
+            }
+            state.entries[idx].ts = state.entries[idx].ts || now();
+            autosave(); recalc(); paint();
+          });
+        });
+        tr.querySelector('[data-act="dup"]').addEventListener("click",()=>{
+          const c=Object.assign({}, state.entries[idx], {id:kid("E"), ts:now()});
+          state.entries.splice(idx+1,0,c); autosave(); recalc(); paint();
+        });
+        tr.querySelector('[data-act="del"]').addEventListener("click",()=>{
+          state.entries.splice(idx,1); autosave(); recalc(); paint();
+        });
+        tbody.appendChild(tr);
+      });
+    }
+    recalc();
+  }
+
+  function recalc(){
+    // meta
+    const start=+state.meta.start||0;
+    const opening=+state.meta.opening||0;
+
+    // aggregates
+    const n=state.entries.length;
+    const sum=(arr,fn)=>arr.reduce((a,x)=>a+(+fn(x)||0),0);
+    const bets   = sum(state.entries, e=>e.bet);
+    const pays   = sum(state.entries, e=>e.payout);
+    const xList  = state.entries.map(e=> +e.x ).filter(v=>!isNaN(v));
+    const opened = state.entries.filter(e=> e.payout!=null );
+
+    const avgBet = n? bets/n : 0;
+    const avgWin = opened.length? (pays/opened.length) : 0;
+    const avgX   = xList.length? (xList.reduce((a,b)=>a+b,0)/xList.length) : 0;
+
+    const totalCost = Math.max(0, start - opening); // cost to collect bonuses
+    const beRemain  = Math.max(0, totalCost - pays); // how much still needed to break even (after some openings)
+    const bePerBonus= n? beRemain/n : 0;
+    const beXPerBonus = (avgBet>0)? (bePerBonus/avgBet) : 0;
+
+    const profit = pays - totalCost;
+    const cnt100 = xList.filter(x=>x>=100).length;
+
+    // stats panel
+    sCasino.textContent = state.meta.casino||"—";
+    sBonuses.textContent= n;
+    sStart.textContent  = money(start);
+    sOpening.textContent= money(opening);
+    sCost.textContent   = money(totalCost);
+    sBE.textContent     = money(beRemain);
+    sBEB.textContent    = money(bePerBonus);
+    sBEXB.textContent   = (beXPerBonus||0).toFixed(1);
+    sAvgBet.textContent = money(avgBet);
+    sAvgWin.textContent = money(avgWin);
+    sAvgX.textContent   = (avgX||0).toFixed(2);
+    sTotBet.textContent = money(bets);
+    sTotPay.textContent = money(pays);
+    sProfit.textContent = money(profit);
+    sProfit.className   = "bad"; if(profit>=0) sProfit.className="good";
+    s100x.textContent   = cnt100;
+    sTime.textContent   = state.lastUpdated? new Date(state.lastUpdated).toLocaleString() : "—";
+    stamp.textContent   = state.lastUpdated? ("Last publish @ "+new Date(state.lastUpdated).toLocaleString()) : "Not published";
+  }
+
+  function autosave(){ sset(K_WORK,state); }
+
+  // ---------- header inputs ----------
+  casinoInp.addEventListener("change",()=>{ state.meta.casino=casinoInp.value.trim(); autosave(); recalc(); });
+  startInp.addEventListener("change", ()=>{ state.meta.start = startInp.value===""?0:+startInp.value; autosave(); recalc(); });
+  openInp.addEventListener("change",  ()=>{ state.meta.opening = openInp.value===""?0:+openInp.value; autosave(); recalc(); });
+
+  // ---------- buttons ----------
+  $("#btnAdd").addEventListener("click", ()=>{
+    state.entries.push({id:kid("E"),slot:"",provider:"",bet:null,payout:null,x:null,ts:now()});
+    autosave(); paint(); toast("Row added");
+  });
+
+  $("#btnAutoX").addEventListener("click", ()=>{
+    state.entries.forEach(e=>{
+      const b=+e.bet||0, p=+e.payout||0;
+      if(b>0 && (p||p===0)) e.x=+(p/b).toFixed(2);
+    });
+    autosave(); paint(); toast("X recalculated");
+  });
+
+  $("#btnSave").addEventListener("click", ()=>{ autosave(); toast("Saved locally"); });
+  $("#btnLoad").addEventListener("click", ()=>{
+    const w=sget(K_WORK); if(!w){ toast("Nothing saved yet",false); return; }
+    state=w; paint(); toast("Loaded");
+  });
+
+  $("#btnExport").addEventListener("click", ()=>{
+    const H=["slot","provider","bet","payout","x","ts"];
+    const rows=[H.join(",")].concat(state.entries.map(e=>{
+      const vals=[e.slot||"",e.provider||"",e.bet??"",e.payout??"",e.x??"",e.ts||""];
+      return vals.map(v=>String(v).includes(",")?('"'+String(v).replace(/"/g,'""')+'"'):String(v)).join(",");
+    }));
+    const blob=new Blob([rows.join("\n")],{type:"text/csv"});
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="bonus_hunt.csv"; a.click();
+  });
+
+  $("#btnImport").addEventListener("click", ()=>{
+    const card=document.createElement("div"); card.className="card";
+    const ta=document.createElement("textarea");
+    ta.placeholder="Paste CSV or JSON here.\nCSV headers: slot,provider,bet,payout,x,ts";
+    ta.style.cssText="width:100%;height:220px;margin-top:8px";
+    card.innerHTML='<div class="row"><span class="pill">Import</span><button class="btn ok">Import</button><button class="btn right">Close</button></div>';
+    card.appendChild(ta); document.body.appendChild(card);
+    const [btnImp, btnClose] = card.querySelectorAll(".btn");
+    btnClose.addEventListener("click", ()=>card.remove());
+    btnImp.addEventListener("click", ()=>{
+      const txt=ta.value.trim(); if(!txt){ toast("Nothing to import",false); return; }
+      try{
+        if(txt[0]==="{"||txt[0]==="["){
+          const j=JSON.parse(txt);
+          state.entries = Array.isArray(j)? j : (Array.isArray(j.entries)? j.entries : []);
+        }else{
+          const lines=txt.replace(/\r/g,"").split("\n").filter(Boolean);
+          const head=lines.shift().split(",").map(h=>h.trim().toLowerCase());
+          const idx=k=>head.indexOf(k);
+          state.entries = lines.map(line=>{
+            const c = parseCSV(line);
+            return {id:kid("E"),
+              slot:c[idx("slot")]||"",
+              provider:c[idx("provider")]||"",
+              bet: parseNum(c[idx("bet")]),
+              payout: parseNum(c[idx("payout")]),
+              x: parseNum(c[idx("x")]),
+              ts:+(c[idx("ts")]||"")||now()
+            };
+          });
+        }
+        autosave(); paint(); toast("Imported");
+        card.remove();
+      }catch{ toast("Import failed",false); }
+    });
+  });
+
+  $("#btnPublish").addEventListener("click", ()=>{
+    // ensure Xs are up-to-date
+    state.entries.forEach(e=>{
+      if(e.x==null){ const b=+e.bet||0, p=+e.payout||0; if(b>0 && (p||p===0)) e.x=+(p/b).toFixed(2); }
+    });
+    const payload = {
+      status:"open",
+      start: +state.meta.start||0,
+      opening: +state.meta.opening||0,
+      entries: state.entries.slice(),
+      lastUpdated: now(),
+      casino: state.meta.casino||""
+    };
+    sset(K_DRAFT, payload);
+    sset(K_LIVE,  payload);
+    state.lastUpdated = payload.lastUpdated;
+    autosave(); recalc();
+    toast("Published to live");
+  });
+
+  $("#btnReset").addEventListener("click", ()=>{
+    if(!confirm("Reset this logger on this device?")) return;
+    state={meta:{casino:"",start:0,opening:0},entries:[],lastUpdated:0};
+    sset(K_WORK,state); paint(); toast("Reset");
+  });
+
+  // ---------- utils ----------
+  function parseCSV(line){
+    const out=[]; let cur=""; let q=false;
+    for(let i=0;i<line.length;i++){
+      const ch=line[i];
+      if(ch==='"'){ if(q && line[i+1]==='"'){ cur+='"'; i++; } else { q=!q; } }
+      else if(ch===',' && !q){ out.push(cur); cur=""; }
+      else { cur+=ch; }
+    }
+    out.push(cur);
+    return out;
+  }
+  function parseNum(s){ if(s==null||s==="") return null; const n=+s; return isNaN(n)? null : n; }
+
+  // ---------- boot ----------
+  paint();
+})();
+</script>
+</body>
+</html>

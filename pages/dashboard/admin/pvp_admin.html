@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>PVP Admin — Knockout</title>
+<meta http-equiv="Cache-Control" content="no-store"/>
+<style>
+  :root{--bg:#060b0d;--ink:#eaf7ff;--muted:#a8c6cc;--line:rgba(0,255,255,.18);--teal:#00ffff;--ok:#11d48a;--bad:#ff6b81;--card:#0d1417}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#000 url("/assets/BG_page.png") center/cover fixed no-repeat;color:var(--ink);font-family:Segoe UI,system-ui,Arial,sans-serif}
+  .wrap{max-width:1100px;margin:18px auto;padding:0 16px}
+  h1{margin:0 0 8px;color:var(--teal);text-shadow:0 0 16px #00ffff55}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:12px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .pill{padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:#081318;color:#cff;font-size:12px}
+  .btn{padding:10px 14px;border:none;border-radius:10px;font-weight:800;cursor:pointer}
+  .btn.ok{background:#ffb42d;color:#241b00}
+  .btn.ghost{background:#121a1d;border:1px solid rgba(255,255,255,.08);color:#d8f2ff}
+  .btn.danger{background:#61222a;color:#fff}
+  .btn.alt{background:#103036;border:1px solid var(--line);color:#cfe}
+  .card{border:1px solid var(--line);border-radius:14px;background:var(--card);padding:14px;margin:12px 0}
+  input{background:#0b1215;border:1px solid var(--line);color:#eaf7ff;padding:10px;border-radius:10px}
+  input.wide{min-width:210px}
+  .match{border:1px solid rgba(255,255,255,.08);border-radius:12px;background:#0b1012;padding:12px;margin:8px 0}
+  .tiny{font-size:12px;color:#9fd}
+  .imgprev{width:36px;height:36px;border-radius:8px;object-fit:cover;border:1px solid rgba(255,255,255,.12);background:#061015}
+  .grid{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center}
+  .undo{font-size:12px;border-radius:999px;border:1px dashed rgba(255,255,255,.22);background:#0a1417;padding:4px 8px;cursor:pointer}
+  .tag{padding:4px 8px;border:1px solid var(--line);border-radius:999px;background:#081318;color:#bfe;font-size:12px}
+  .inbox{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .inboxList{border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:8px;max-height:160px;overflow:auto;background:#0c1216}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row" style="justify-content:space-between">
+    <div class="row">
+      <h1>PVP Admin — Knockout</h1>
+      <span id="badge" class="pill">Not published</span>
+      <span id="msg" class="pill">Ready</span>
+    </div>
+    <div class="row">
+      <button id="btnPublish" class="btn ok">Publish</button>
+      <button id="btnReset" class="btn danger">Reset All (Rounds)</button>
+    </div>
+  </div>
+  <p class="sub">Add matchups, click a winner (auto-advances), and publish. Images come from <code>/assets/slot_images/&lt;slug&gt;.png</code> with fallback to <code>mateslots_logo.png</code>.</p>
+
+  <!-- Quick add -->
+  <div class="card">
+    <div class="row">
+      <span class="pill">Add Play-in Match</span>
+      <img id="lPrev" class="imgprev" alt="">
+      <input id="lName" class="wide" placeholder="Left player">
+      <input id="lGame" class="wide" placeholder="Left game (e.g. rip city)">
+      <span class="pill">vs</span>
+      <img id="rPrev" class="imgprev" alt="">
+      <input id="rName" class="wide" placeholder="Right player">
+      <input id="rGame" class="wide" placeholder="Right game (e.g. gates)">
+      <button id="btnAdd" class="btn alt">+ Add Match</button>
+    </div>
+  </div>
+
+  <!-- Inbox (from entry form[s]) -->
+  <div class="card">
+    <div class="inbox">
+      <span class="tag">Entries Inbox</span>
+      <button id="btnInboxRefresh" class="btn ghost">Refresh Inbox</button>
+      <button id="btnPairSelected" class="btn ghost">Pair Selected → Play-in</button>
+      <button id="btnAutoPair" class="btn ghost">Auto-pair All</button>
+      <button id="btnClearInbox" class="btn danger">Clear Inbox</button>
+      <span id="inboxCount" class="pill">0 entries</span>
+      <span id="inboxKey" class="pill" title="Detected storage key">—</span>
+    </div>
+    <div id="inboxList" class="inboxList">No entries yet.</div>
+  </div>
+
+  <!-- Rounds -->
+  <div id="rounds"></div>
+</div>
+
+<script>
+/* ========= tiny helpers ========= */
+const $ = s => document.querySelector(s);
+const el = (t, cls) => { const a=document.createElement(t); if(cls) a.className=cls; return a; };
+const up = s => String(s||'').trim().toUpperCase();
+const sget=(k,d=null)=>{ try{const v=localStorage.getItem(k);return v?JSON.parse(v):d;}catch(_){return d;} };
+const sset=(k,v)=>{ try{localStorage.setItem(k,JSON.stringify(v));}catch(_){ } };
+const now = () => new Date().toLocaleTimeString();
+
+/* ========= images ========= */
+function slotImgFrom(title){
+  const DEF="/assets/slot_images/mateslots_logo.png";
+  const special={"rip city":"rip_city","gates":"gates_of_olympus","gates of olympus":"gates_of_olympus","starlight princess":"starlight_princess"};
+  if(!title) return DEF;
+  let s=String(title).trim().toLowerCase();
+  if(special[s]) s=special[s];
+  s=s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/&/g,'and').replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'');
+  return `/assets/slot_images/${s||'mateslots_logo'}.png`;
+}
+
+/* ========= keys (legacy-friendly) ========= */
+const PRIMARY_INBOX = 'pvp:entry:inbox';
+const ALT_INBOX_KEYS = [
+  'pvp:entries','pvp:entry','pvp:entry:list','pvp:entry_queue','pvp:playin:inbox','pvp:inbox'
+];
+let INBOX_KEY = PRIMARY_INBOX;
+
+function normalizeEntries(v){
+  let a = [];
+  if(Array.isArray(v)) a=v;
+  else if(v && Array.isArray(v.items)) a=v.items;
+  else return [];
+  return a.map(x=>({
+    id: x.id || x._id || x.ts || (Date.now()+Math.random()),
+    username: up(x.username || x.user || x.name || x.player || x.nickname || x.handle || ''),
+    game: x.game || x.slot || x.title || x.leftGame || x.rightGame || '',
+    ts: x.ts || x.time || Date.now()
+  })).filter(e=>e.username);
+}
+
+function sniffInbox(){
+  // 1) primary
+  let arr = normalizeEntries(sget(PRIMARY_INBOX));
+  if(arr.length){ INBOX_KEY=PRIMARY_INBOX; return arr; }
+  // 2) known alternates
+  for(const k of ALT_INBOX_KEYS){
+    const v = normalizeEntries(sget(k));
+    if(v.length){ INBOX_KEY=k; return v; }
+  }
+  // 3) scan everything that looks like pvp+entry/inbox
+  for(let i=0;i<localStorage.length;i++){
+    const k = localStorage.key(i);
+    if(!/pvp.*(entry|inbox)/i.test(k)) continue;
+    const v = normalizeEntries(sget(k));
+    if(v.length){ INBOX_KEY=k; return v; }
+  }
+  INBOX_KEY = PRIMARY_INBOX; // default
+  return [];
+}
+
+/* ========= bracket state ========= */
+const K_BUILDER = 'pvp:builder';
+const K_LIVE    = 'pvp:live';
+
+let state = sget(K_BUILDER) || {
+  rounds: [
+    { name:"Play-in", matches:[] },
+    { name:"Quarterfinals", matches:[] },
+    { name:"Semifinals", matches:[] },
+    { name:"Grand Final", matches:[] }
+  ],
+  publishedAt: 0
+};
+function save(){ sset(K_BUILDER,state); }
+
+/* ========= inbox UI ========= */
+function renderInbox(){
+  const box = $("#inboxList");
+  const list = sniffInbox();
+  $("#inboxCount").textContent = `${list.length} entries`;
+  $("#inboxKey").textContent = INBOX_KEY;
+  if(!list.length){ box.innerHTML='No entries yet.'; return; }
+  box.innerHTML='';
+  list.forEach((e,i)=>{
+    const row=document.createElement('label');
+    row.style.display='grid';
+    row.style.gridTemplateColumns='24px 1fr 1fr auto';
+    row.style.alignItems='center'; row.style.gap='8px'; row.style.padding='4px 0';
+    row.innerHTML=`<input type="checkbox" data-id="${e.id}"><span>${e.username}</span><span class="tiny">${e.game||''}</span><span class="tiny">${new Date(e.ts).toLocaleString()}</span>`;
+    box.appendChild(row);
+  });
+}
+$("#btnInboxRefresh").onclick = renderInbox;
+$("#btnClearInbox").onclick = ()=>{
+  if(!confirm('Clear all entries from '+INBOX_KEY+'?')) return;
+  sset(INBOX_KEY, []);
+  renderInbox();
+};
+$("#btnPairSelected").onclick = ()=>{
+  const all = sniffInbox();
+  const selectedIds = Array.from($("#inboxList").querySelectorAll('input[type=checkbox]:checked')).map(x=>x.dataset.id);
+  const picks = all.filter(x=> selectedIds.includes(String(x.id)));
+  if(picks.length<2){ alert('Select at least 2 entries.'); return; }
+  for(let i=0;i<picks.length;i+=2){
+    const L=picks[i], R=picks[i+1]; if(!R) break;
+    addMatchToRound(0, L.username, L.game, R.username, R.game);
+  }
+  // remove the ones we used
+  const keep = all.filter(x=> !selectedIds.includes(String(x.id)));
+  sset(INBOX_KEY, keep);
+  renderInbox();
+};
+$("#btnAutoPair").onclick = ()=>{
+  const all = sniffInbox();
+  if(all.length<2){ alert('Need at least two entries.'); return; }
+  for(let i=0;i<all.length;i+=2){
+    const L=all[i], R=all[i+1]; if(!R) break;
+    addMatchToRound(0, L.username, L.game, R.username, R.game);
+  }
+  sset(INBOX_KEY, []); renderInbox();
+};
+
+/* ========= add / render ========= */
+function addMatchToRound(roundIdx, leftName, leftGame, rightName, rightGame){
+  const m = {
+    id: "m_"+Math.random().toString(36).slice(2,8),
+    left:  { username: up(leftName||''),  game: String(leftGame||"")  },
+    right: { username: up(rightName||''), game: String(rightGame||"") },
+    leftScore: 0, rightScore: 0, winner: null, status:"pending", _history:[]
+  };
+  state.rounds[roundIdx].matches.push(m);
+  save(); paint();
+}
+
+function renderRound(round, idx){
+  const card = el('div','card');
+  const head = el('div','row');
+  head.innerHTML = `<span class="pill">${round.name}</span><span class="pill">${round.matches.length} match${round.matches.length!==1?'es':''}</span>`;
+  card.appendChild(head);
+
+  round.matches.forEach((m)=>{
+    const row = el('div','match');
+    const grid = el('div','grid');
+
+    // left
+    const l = el('div');
+    const lImg = el('img','imgprev'); lImg.src = slotImgFrom(m.left.game); lImg.onerror=()=>{ lImg.src="/assets/slot_images/mateslots_logo.png"; };
+    const lName = el('div'); lName.innerHTML = `<b>${m.left.username||'—'}</b><div class="tiny">${m.left.game||'&nbsp;'}</div>`;
+    const lWrap = el('div','row'); lWrap.appendChild(lImg); lWrap.appendChild(lName);
+    l.appendChild(lWrap);
+
+    // mid
+    const mid = el('div','row'); mid.style.justifyContent='center'; mid.innerHTML = `<span class="pill">VS</span>`;
+
+    // right
+    const r = el('div'); r.style.textAlign='right';
+    const rImg = el('img','imgprev'); rImg.src = slotImgFrom(m.right.game); rImg.onerror=()=>{ rImg.src="/assets/slot_images/mateslots_logo.png"; };
+    const rName = el('div'); rName.innerHTML = `<b>${m.right.username||'—'}</b><div class="tiny">${m.right.game||'&nbsp;'}</div>`;
+    const rWrap = el('div','row'); rWrap.style.justifyContent='flex-end'; rWrap.appendChild(rName); rWrap.appendChild(rImg);
+    r.appendChild(rWrap);
+
+    grid.appendChild(l); grid.appendChild(mid); grid.appendChild(r);
+    row.appendChild(grid);
+
+    // controls
+    const bar = el('div','row'); bar.style.marginTop='8px';
+    const lBtn = el('button','btn ghost'); lBtn.textContent="Left Wins";
+    const rBtn = el('button','btn ghost'); rBtn.textContent="Right Wins";
+    const clr  = el('button','btn danger'); clr.textContent="Clear";
+    const undo = el('button','undo'); undo.textContent='Undo';
+    const status = el('span','pill'); status.textContent = m.winner? (m.winner==='L'? (m.left.username||'LEFT') : (m.right.username||'RIGHT')) : 'Pending';
+
+    function recalcFrom(roundIdx){
+      // rebuild downstream rounds from winners
+      for(let i=roundIdx;i<state.rounds.length-1;i++){
+        const fromWinners = state.rounds[i].matches.filter(x=>x.winner==='L'||x.winner==='R')
+          .map(x => x.winner==='L' ? x.left : x.right);
+        const to = state.rounds[i+1];
+        const rebuilt=[];
+        for(let j=0;j<fromWinners.length;j+=2){
+          const L = fromWinners[j]   || { username:'BYE', game:'' };
+          const R = fromWinners[j+1] || { username:'BYE', game:'' };
+          const keep = to.matches[Math.floor(j/2)];
+          rebuilt.push({
+            id: keep?.id || "m_"+Math.random().toString(36).slice(2,8),
+            left:L, right:R, leftScore:0, rightScore:0, winner:null, status:"pending", _history:[]
+          });
+        }
+        to.matches = rebuilt;
+      }
+    }
+    function setWinner(w){
+      m._history.push({winner:m.winner,leftScore:m.leftScore,rightScore:m.rightScore});
+      m.winner=w; m.status='done';
+      m.leftScore = (w==='L')?1:0; m.rightScore = (w==='R')?1:0;
+      save(); recalcFrom( state.rounds.findIndex(r=>r.matches.includes(m)) ); paint();
+    }
+    function clearWinner(){
+      m._history.push({winner:m.winner,leftScore:m.leftScore,rightScore:m.rightScore});
+      m.winner=null; m.status='pending'; m.leftScore=0; m.rightScore=0;
+      save(); recalcFrom( state.rounds.findIndex(r=>r.matches.includes(m)) ); paint();
+    }
+    function doUndo(){
+      const last=m._history.pop(); if(!last) return;
+      m.winner=last.winner; m.leftScore=last.leftScore; m.rightScore=last.rightScore;
+      m.status=m.winner? 'done':'pending'; save();
+      recalcFrom( state.rounds.findIndex(r=>r.matches.includes(m)) ); paint();
+    }
+
+    lBtn.onclick = ()=> setWinner('L');
+    rBtn.onclick = ()=> setWinner('R');
+    clr.onclick  = clearWinner;
+    undo.onclick = doUndo;
+
+    bar.appendChild(lBtn); bar.appendChild(rBtn); bar.appendChild(clr); bar.appendChild(undo); bar.appendChild(status);
+    row.appendChild(bar);
+    card.appendChild(row);
+  });
+  return card;
+}
+
+function paint(){
+  const root = $("#rounds"); root.innerHTML = "";
+  state.rounds.forEach((r,i)=> root.appendChild(renderRound(r,i)));
+}
+
+/* ========= quick add + previews ========= */
+function previewHook(){
+  const lG=$("#lGame"), rG=$("#rGame"), lP=$("#lPrev"), rP=$("#rPrev");
+  const upd = ()=>{ lP.src=slotImgFrom(lG.value); lP.onerror=()=>lP.src="/assets/slot_images/mateslots_logo.png";
+                    rP.src=slotImgFrom(rG.value); rP.onerror=()=>rP.src="/assets/slot_images/mateslots_logo.png"; };
+  lG.addEventListener('input',upd); rG.addEventListener('input',upd); upd();
+}
+$("#btnAdd").onclick = ()=>{
+  const lN=$("#lName").value, lG=$("#lGame").value, rN=$("#rName").value, rG=$("#rGame").value;
+  if(!lN || !rN){ alert("Enter both player names."); return; }
+  addMatchToRound(0, lN,lG, rN,rG);
+  $("#lName").value=""; $("#lGame").value=""; $("#rName").value=""; $("#rGame").value="";
+  previewHook();
+};
+
+/* ========= publish ========= */
+function buildLive(){
+  const live={ title:"PVP — Knockout", lastUpdated:Date.now(), rounds: state.rounds };
+  live.flat=[];
+  state.rounds.forEach(r=> r.matches.forEach(m=>{
+    live.flat.push({
+      id:m.id, round:r.name,
+      left:m.left.username, right:m.right.username,
+      leftProv:m.left.game, rightProv:m.right.game,
+      leftImg:slotImgFrom(m.left.game), rightImg:slotImgFrom(m.right.game),
+      leftScore:m.leftScore|0, rightScore:m.rightScore|0, winner:m.winner
+    });
+  }));
+  return live;
+}
+async function publish(){
+  $("#btnPublish").disabled=true; $("#msg").textContent='Publishing…';
+  const live = buildLive();
+  sset(K_LIVE, live); // local live for Unified Live + widget
+  try{
+    const r = await fetch("/api/pvp/bracket", {
+      method:"POST", credentials:"include",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ builder: state })
+    });
+    if(!r.ok) throw new Error("HTTP "+r.status);
+  }catch(_){ /* dev/offline -> ignore */ }
+  $("#badge").textContent = "Published @ "+now();
+  $("#msg").textContent = "Ready";
+  $("#btnPublish").disabled=false;
+}
+
+/* ========= reset ========= */
+$("#btnReset").onclick = ()=>{ if(!confirm("Clear all rounds?")) return;
+  state.rounds.forEach(r=> r.matches=[]); save(); paint(); };
+
+/* ========= boot ========= */
+previewHook(); renderInbox(); paint();
+$("#btnPublish").onclick = publish;
+</script>
+</body>
+</html>
