@@ -45,8 +45,7 @@ const SIGNUP_BONUS = Number(process.env.SIGNUP_BONUS || 0);
 /* ===== Kick OAuth ENV ===== */
 const KICK_OAUTH_AUTHORIZE = "https://id.kick.com/oauth/authorize";
 const KICK_OAUTH_TOKEN     = "https://id.kick.com/oauth/token";
-// UPDATED: use the stable current-user endpoint
-const KICK_USER_URL        = "https://kick.com/api/v1/user";
+const KICK_API_BASE        = "https://api.kick.com/public/v1";
 const KICK_CLIENT_ID       = process.env.KICK_CLIENT_ID || "";
 const KICK_CLIENT_SECRET   = process.env.KICK_CLIENT_SECRET || "";
 const KICK_REDIRECT_URI    = process.env.KICK_REDIRECT_URI || "https://lash3z.com/auth/kick/callback";
@@ -720,7 +719,7 @@ app.get("/auth/kick", requireViewer, (req, res) => {
   res.redirect(url.toString());
 });
 
-// OAuth callback (updated endpoint + debug logging + fallback)
+// OAuth callback
 app.get("/auth/kick/callback", async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query;
@@ -745,53 +744,17 @@ app.get("/auth/kick/callback", async (req, res) => {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body
     });
-    const tokens = await tokRes.json().catch(() => ({}));
+    const tokens = await tokRes.json();
     if (!tokRes.ok || !tokens?.access_token) {
-      console.error("[Kick OAuth] token exchange failed:", tokRes.status, tokens);
       return res.redirect(`/profile?kickError=token_exchange_failed`);
     }
-    console.log("[Kick OAuth] token ok len:", String(tokens.access_token || "").length);
 
-    // Fetch current user profile from Kick (v1)
-    let profile = null;
-    try {
-      const meRes = await fetch(KICK_USER_URL, {
-        headers: { Authorization: `Bearer ${tokens.access_token}` }
-      });
-      const j = await meRes.json().catch(() => ({}));
-      if (!meRes.ok) {
-        console.error("[Kick OAuth] v1 /user fetch bad:", meRes.status, j);
-      } else {
-        profile = {
-          id: j?.id ?? j?.data?.id ?? j?.user?.id,
-          username: (j?.username ?? j?.data?.username ?? j?.user?.username ?? "").toString()
-        };
-      }
-    } catch (e) {
-      console.error("[Kick OAuth] v1 /user threw:", e);
-    }
-
-    // Fallback to v2 if needed
-    if (!profile?.id) {
-      try {
-        const alt = await fetch("https://kick.com/api/v2/user", {
-          headers: { Authorization: `Bearer ${tokens.access_token}` }
-        });
-        const jj = await alt.json().catch(() => ({}));
-        if (alt.ok) {
-          profile = {
-            id: jj?.id ?? jj?.data?.id ?? jj?.user?.id,
-            username: (jj?.username ?? jj?.data?.username ?? jj?.user?.username ?? "").toString()
-          };
-        } else {
-          console.error("[Kick OAuth] v2 /user fetch bad:", alt.status, jj);
-        }
-      } catch (e) {
-        console.error("[Kick OAuth] v2 /user threw:", e);
-      }
-    }
-
-    if (!profile?.id) {
+    // Fetch current user profile from Kick
+    const meRes = await fetch(`${KICK_API_BASE}/users/me`, {
+      headers: { Authorization: `Bearer ${tokens.access_token}` }
+    });
+    const profile = await meRes.json();
+    if (!meRes.ok || !profile?.id) {
       return res.redirect(`/profile?kickError=user_fetch_failed`);
     }
 
