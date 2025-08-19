@@ -38,6 +38,8 @@
   .badge{padding:4px 8px;border-radius:999px;border:1px solid var(--line);background:#081318;color:#bfe}
   .toast{position:fixed;right:16px;bottom:16px;background:#0b1f21;border:1px solid var(--line);border-radius:10px;padding:10px 12px;opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none;z-index:9999}
   .toast.on{opacity:1;transform:translateY(0)}
+  .muted{color:var(--muted)}
+  .nowrap{white-space:nowrap}
   @media (max-width: 980px){ .grid{grid-template-columns:1fr} }
 </style>
 </head>
@@ -65,10 +67,8 @@
           <tbody></tbody>
         </table>
       </div>
-      <div class="mini" style="margin-top:6px">Tip: Use “Giveaways” below to add entries to the current open raffle.</div>
+      <div class="mini" style="margin-top:6px">Tip: Use <span class="badge">/api/admin/raffles/:id/entries</span> for admin reads.</div>
     </div>
-
-    
 
     <!-- VIP WALLET -->
     <div class="panel">
@@ -81,11 +81,123 @@
         <span id="vipMsg" class="pill">Ready</span>
       </div>
       <div class="hr"></div>
-      <div class="mini">Posts to <code>/api/wallet/adjust</code>. (Admin bypass must be on for now.)</div>
+      <div class="mini">Posts to <code>/api/wallet/adjust</code>. (Admin login or bypass required.)</div>
+    </div>
+
+    <!-- PROMO CODES: CREATE -->
+    <div class="panel">
+      <h2>Promo Codes — Create</h2>
+      <div class="row">
+        <label class="mini muted">Amount</label>
+        <select id="pcAmount">
+          <option>5</option><option>10</option><option>15</option>
+          <option>20</option><option>25</option><option>30</option>
+        </select>
+
+        <label class="mini muted">Max Redemptions</label>
+        <input id="pcMax" type="number" value="1" min="1" style="width:110px">
+
+        <label class="mini muted">Per-User Limit</label>
+        <input id="pcPerUser" type="number" value="1" min="1" style="width:110px">
+
+        <label class="mini muted">Expires</label>
+        <input id="pcExpiry" type="datetime-local">
+
+        <label class="mini muted">Notes</label>
+        <input id="pcNotes" placeholder="Twitter drop / Discord" style="min-width:180px">
+
+        <button id="pcCreate" class="ok">Create Code</button>
+        <span id="pcMsg" class="pill">Ready</span>
+      </div>
+      <div class="hr"></div>
+      <div class="mini">Endpoint: <code>/api/admin/promo/create</code></div>
+      <div class="mini" id="pcCreateOut"></div>
+    </div>
+
+    <!-- PROMO CODES: BATCH -->
+    <div class="panel">
+      <h2>Promo Codes — Batch Generate</h2>
+      <div class="row">
+        <label class="mini muted">Prefix</label>
+        <input id="pcPrefix" placeholder="L3Z-AUG" style="width:140px">
+
+        <label class="mini muted">Amount</label>
+        <select id="pcAmount2">
+          <option>5</option><option>10</option><option>15</option>
+          <option>20</option><option>25</option><option>30</option>
+        </select>
+
+        <label class="mini muted">Count</label>
+        <input id="pcCount" type="number" value="50" min="1" max="5000" style="width:110px">
+
+        <label class="mini muted">Max Redemptions</label>
+        <input id="pcMax2" type="number" value="1" min="1" style="width:110px">
+
+        <label class="mini muted">Per-User Limit</label>
+        <input id="pcPerUser2" type="number" value="1" min="1" style="width:110px">
+
+        <label class="mini muted">Expires</label>
+        <input id="pcExpiry2" type="datetime-local">
+
+        <label class="mini muted">Notes</label>
+        <input id="pcNotes2" placeholder="Campaign tag" style="min-width:160px">
+
+        <button id="pcBatch" class="warn">Generate Batch</button>
+        <span id="pcBatchMsg" class="pill">Ready</span>
+      </div>
+      <div class="hr"></div>
+      <div class="mini">Endpoint: <code>/api/admin/promo/generate</code></div>
+      <pre id="pcBatchOut" class="mini" style="white-space:pre-wrap"></pre>
+    </div>
+
+    <!-- PROMO CODES: LIST / DISABLE -->
+    <div class="panel full">
+      <h2>Promo Codes — List</h2>
+      <div class="row">
+        <select id="pcFilter">
+          <option value="all">All</option>
+          <option value="1">Active</option>
+          <option value="0">Inactive</option>
+        </select>
+        <button id="pcRefresh">Refresh</button>
+        <span id="pcListMsg" class="pill">Ready</span>
+        <span class="right mini muted">Use this to monitor redemptions in real time on stream.</span>
+      </div>
+      <div class="hr"></div>
+      <div style="max-height:360px;overflow:auto;border:1px solid var(--line);border-radius:10px">
+        <table class="tbl" id="pcTbl">
+          <thead>
+            <tr>
+              <th>Code</th>
+              <th>Amount</th>
+              <th>Redeemed</th>
+              <th>Per-User</th>
+              <th>Active</th>
+              <th>Expires</th>
+              <th>Notes</th>
+              <th class="nowrap">Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- PROMO: REDEEM TESTER -->
+    <div class="panel">
+      <h2>Redeem LBX (tester)</h2>
+      <div class="row">
+        <input id="rdmCode" placeholder="Enter promo code" style="flex:1;min-width:220px">
+        <button id="rdmGo">Redeem</button>
+        <span id="rdmMsg" class="pill">Ready</span>
+      </div>
+      <div class="hr"></div>
+      <div class="mini">Calls <code>/api/promo/redeem</code> using your current <code>viewer</code> cookie.</div>
+      <div class="mini" id="rdmOut"></div>
     </div>
 
     <!-- UTILITIES -->
-    <div class="panel full">
+    <div class="panel">
       <h2>Utilities</h2>
       <div class="row">
         <button id="btnPing">Ping API</button>
@@ -119,7 +231,7 @@
 })();
 </script>
 
-<!-- Page logic (no admin checks) -->
+<!-- Page logic (admin hub) -->
 <script>
 (function(){
   "use strict";
@@ -129,22 +241,25 @@
   function showToast(t){ toast.textContent=t||"Saved."; toast.classList.add("on"); setTimeout(function(){ toast.classList.remove("on"); }, 1400); }
   function up(s){ return String(s||"").trim().toUpperCase(); }
   function pill(el,txt,ok){ el.textContent=txt; el.style.background = ok ? "#103d30" : "#0f1720"; el.style.borderColor = ok ? "#1fa37b" : "var(--line)"; }
-  function renderEntries(tbody,rows){
-    tbody.innerHTML = (rows||[]).map(function(r,i){
-      var ts = r.ts ? new Date(r.ts).toLocaleString() : "—";
-      return '<tr><td>'+(i+1)+'</td><td>'+up(r.user||r.username||"")+'</td><td>'+ts+'</td></tr>';
-    }).join("") || '<tr><td colspan="3" class="mini">No entries</td></tr>';
-  }
+  function fmtDate(d){ if(!d) return "—"; try{ return new Date(d).toLocaleString(); }catch(_){ return "—"; } }
 
   /* ---------- RAFFLES (read-only + local draw) ---------- */
   var rfId=$("#rfId"), rfRefresh=$("#rfRefresh"), rfDraw=$("#rfDraw"), rfMsg=$("#rfMsg"), rfTbl=$("#rfTbl tbody");
+  function renderEntries(tbody,rows){
+    tbody.innerHTML = (rows||[]).map(function(r,i){
+      var ts = r.ts ? new Date(r.ts).toLocaleString() : (r.createdAt?fmtDate(r.createdAt):"—");
+      var name = up(r.user||r.username||"");
+      return '<tr><td>'+(i+1)+'</td><td>'+name+'</td><td>'+ts+'</td></tr>';
+    }).join("") || '<tr><td colspan="3" class="mini">No entries</td></tr>';
+  }
   function getRaffleEntriesById(id){
     if(!id){ pill(rfMsg,"Missing ID"); return; }
     rfMsg.textContent="Loading…";
-    api.get("/api/raffles/"+encodeURIComponent(id)+"/entries").then(function(j){
+    api.get("/api/admin/raffles/"+encodeURIComponent(up(id))+"/entries").then(function(j){
       renderEntries(rfTbl, j.entries||[]);
       pill(rfMsg,"OK",true);
-    }).catch(function(){
+    }).catch(function(e){
+      console.warn(e);
       renderEntries(rfTbl, []);
       pill(rfMsg,"Load failed");
     });
@@ -157,47 +272,7 @@
     showToast("Winner: "+pick);
   });
 
-  /* ---------- GIVEAWAYS (public) ---------- */
-  var gvOpen=$("#gvOpen"), gvUser=$("#gvUser"), gvAdd=$("#gvAdd"), gvRefresh=$("#gvRefresh"), gvDraw=$("#gvDraw"), gvMsg=$("#gvMsg"), gvTbl=$("#gvTbl tbody");
-  var currentRid = null;
-
-  function refreshCurrentRaffle(){
-    gvMsg.textContent="Loading…";
-    api.get("/api/raffles/public").then(function(j){
-      currentRid = j && j.id ? String(j.id) : null;
-      gvOpen.textContent = "Open: " + (currentRid || "—");
-      if (currentRid){
-        return api.get("/api/raffles/"+encodeURIComponent(currentRid)+"/entries");
-      } else {
-        return { entries: [] };
-      }
-    }).then(function(j2){
-      renderEntries(gvTbl, j2.entries||[]);
-      pill(gvMsg,"OK",true);
-    }).catch(function(){
-      renderEntries(gvTbl, []);
-      pill(gvMsg,"Load failed");
-    });
-  }
-
-  gvRefresh.addEventListener("click", refreshCurrentRaffle);
-  gvAdd.addEventListener("click", function(){
-    var user=up(gvUser.value);
-    if(!user){ pill(gvMsg,"Need USER"); return; }
-    gvMsg.textContent="Adding…";
-    api.post("/api/giveaways/enter", { user:user }).then(function(){
-      gvUser.value=""; showToast("Entry added");
-      refreshCurrentRaffle();
-    }).catch(function(){ pill(gvMsg,"Add failed"); });
-  });
-  gvDraw.addEventListener("click", function(){
-    var names = $$("#gvTbl tr td:nth-child(2)").map(function(td){ return td.textContent.trim(); });
-    if(!names.length){ pill(gvMsg,"No entries"); return; }
-    var pick = names[Math.floor(Math.random()*names.length)];
-    showToast("Winner: "+pick);
-  });
-
-  /* ---------- VIP WALLET (bypass relies on server) ---------- */
+  /* ---------- VIP WALLET ---------- */
   var vipUser=$("#vipUser"), vipAmt=$("#vipAmt"), vipWhy=$("#vipWhy"), vipApply=$("#vipApply"), vipMsg=$("#vipMsg");
   vipApply.addEventListener("click", function(){
     var user=up(vipUser.value), amt=Number(vipAmt.value||0), why=(vipWhy.value||"ADJUSTMENT").toString();
@@ -212,6 +287,118 @@
     }).finally(function(){ vipApply.disabled=false; });
   });
 
+  /* ---------- PROMO: CREATE ---------- */
+  var pcMsg=$("#pcMsg"), pcCreate=$("#pcCreate"), pcCreateOut=$("#pcCreateOut");
+  pcCreate.addEventListener("click", function(){
+    var body = {
+      amount: Number($("#pcAmount").value),
+      maxRedemptions: Number($("#pcMax").value||1),
+      perUserLimit: Number($("#pcPerUser").value||1),
+      expiresAt: $("#pcExpiry").value ? new Date($("#pcExpiry").value).toISOString() : null,
+      notes: $("#pcNotes").value || ""
+    };
+    pcCreate.disabled = true; pcMsg.textContent = "Creating…";
+    api.post("/api/admin/promo/create", body).then(function(r){
+      pill(pcMsg,"Created",true);
+      pcCreateOut.textContent = "Code: " + r.code;
+      showToast("Promo created");
+      refreshPromoList();
+    }).catch(function(e){
+      pill(pcMsg, (e.body&&e.body.error)||"Error");
+    }).finally(function(){ pcCreate.disabled=false; });
+  });
+
+  /* ---------- PROMO: BATCH ---------- */
+  var pcBatch=$("#pcBatch"), pcBatchMsg=$("#pcBatchMsg"), pcBatchOut=$("#pcBatchOut");
+  pcBatch.addEventListener("click", function(){
+    var body = {
+      prefix: $("#pcPrefix").value || "L3Z",
+      amount: Number($("#pcAmount2").value),
+      count: Number($("#pcCount").value||1),
+      maxRedemptions: Number($("#pcMax2").value||1),
+      perUserLimit: Number($("#pcPerUser2").value||1),
+      expiresAt: $("#pcExpiry2").value ? new Date($("#pcExpiry2").value).toISOString() : null,
+      notes: $("#pcNotes2").value || ""
+    };
+    pcBatch.disabled=true; pcBatchMsg.textContent="Generating…";
+    api.post("/api/admin/promo/generate", body).then(function(r){
+      pill(pcBatchMsg,"OK",true);
+      var sample = (r.sample||[]).join("\n");
+      pcBatchOut.textContent = "Generated: " + r.generated + (sample?("\nSample:\n"+sample):"");
+      showToast("Batch ready");
+      refreshPromoList();
+    }).catch(function(e){
+      pill(pcBatchMsg,(e.body&&e.body.error)||"Error");
+    }).finally(function(){ pcBatch.disabled=false; });
+  });
+
+  /* ---------- PROMO: LIST / DISABLE ---------- */
+  var pcTblBody=$("#pcTbl tbody"), pcListMsg=$("#pcListMsg"), pcRefresh=$("#pcRefresh"), pcFilter=$("#pcFilter");
+  function renderPromoTable(items){
+    pcTblBody.innerHTML = (items||[]).map(function(p){
+      var red = Number(p.redeemedCount||0) + " / " + Number(p.maxRedemptions||0);
+      var act = p.active ? '<span class="badge">YES</span>' : '<span class="badge" style="background:#241018;border-color:#7e2a3c;color:#fbb">NO</span>';
+      var exp = p.expiresAt ? fmtDate(p.expiresAt) : "—";
+      var btn = p.active ? ('<button class="danger btnDisable" data-code="'+p.code+'">Disable</button>') : '';
+      return '<tr>'+
+        '<td class="nowrap">'+p.code+'</td>'+
+        '<td>'+Number(p.amount||0)+'</td>'+
+        '<td>'+red+'</td>'+
+        '<td>'+Number(p.perUserLimit||1)+'</td>'+
+        '<td>'+act+'</td>'+
+        '<td>'+exp+'</td>'+
+        '<td>'+(p.notes||'')+'</td>'+
+        '<td>'+btn+'</td>'+
+      '</tr>';
+    }).join("") || '<tr><td colspan="8" class="mini">No promo codes found.</td></tr>';
+
+    // wire disable buttons
+    $$(".btnDisable", pcTblBody).forEach(function(b){
+      b.addEventListener("click", function(){
+        var code = this.getAttribute("data-code");
+        if (!code) return;
+        this.disabled = true;
+        api.post("/api/admin/promo/disable", { code }).then(function(){
+          showToast("Disabled: "+code);
+          refreshPromoList();
+        }).catch(function(e){
+          alert("Disable failed: " + ((e.body&&e.body.error)||"Error"));
+        }).finally(()=>{ /* noop; refreshed anyway */});
+      });
+    });
+  }
+  function refreshPromoList(){
+    pcListMsg.textContent = "Loading…";
+    var f = pcFilter.value;
+    var url = (f==="all") ? "/api/admin/promo/list" : ("/api/admin/promo/list?active="+encodeURIComponent(f));
+    api.get(url).then(function(r){
+      renderPromoTable(r.items||[]);
+      pill(pcListMsg,"OK",true);
+    }).catch(function(e){
+      console.warn(e);
+      renderPromoTable([]);
+      pill(pcListMsg,"Load failed");
+    });
+  }
+  pcRefresh.addEventListener("click", refreshPromoList);
+  pcFilter.addEventListener("change", refreshPromoList);
+
+  /* ---------- PROMO: REDEEM TEST ---------- */
+  var rdmGo=$("#rdmGo"), rdmCode=$("#rdmCode"), rdmMsg=$("#rdmMsg"), rdmOut=$("#rdmOut");
+  rdmGo.addEventListener("click", function(){
+    var code = (rdmCode.value||"").trim();
+    if (!code){ pill(rdmMsg,"Enter a code"); return; }
+    rdmGo.disabled=true; rdmMsg.textContent="Redeeming…";
+    api.post("/api/promo/redeem",{ code }).then(function(r){
+      pill(rdmMsg,"OK",true);
+      rdmOut.textContent = "+"+r.added+" LBX added. New balance: "+(r.balance!=null?r.balance:"(see wallet)");
+      showToast("Redeemed");
+      rdmCode.value="";
+    }).catch(function(e){
+      pill(rdmMsg, (e.body&&e.body.error)||"Failed");
+    }).finally(function(){ rdmGo.disabled=false; });
+  });
+
   /* ---------- Utilities ---------- */
   var utilMsg=$("#utilMsg");
   $("#btnPing").addEventListener("click", function(){
@@ -221,7 +408,7 @@
   });
 
   // initial load
-  refreshCurrentRaffle();
+  refreshPromoList();
 })();
 </script>
 </body>
