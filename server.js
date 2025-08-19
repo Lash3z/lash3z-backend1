@@ -5,7 +5,7 @@ import path from "path";
 import express from "express";
 import cookieParser from "cookie-parser";
 import jwt from "jsonwebtoken";
-import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { MongoClient, ObjectId } from "mongodb";
 import dotenv from "dotenv";
@@ -34,15 +34,6 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s=>s.trim()).filter(Boolean);
 
 const SIGNUP_BONUS = Number(process.env.SIGNUP_BONUS || 0);
-
-if (
-  NODE_ENV === "production" &&
-  !DISABLE_ADMIN_AUTH &&
-  (!ADMIN_USER || !ADMIN_PASS || !ADMIN_SECRET || !JWT_SECRET)
-) {
-  console.error("[SECURITY] Missing required admin credentials/secrets in production.");
-  process.exit(1);
-}
 
 /* ===================== Paths ===================== */
 const __filename = fileURLToPath(import.meta.url);
@@ -278,6 +269,7 @@ app.use(express.static(PUBLIC_DIR, {
 
 const U = (s) => String(s || "").trim().toUpperCase();
 const nowISO = () => new Date().toISOString();
+const hash = (pwd) => crypto.createHash("sha256").update(String(pwd)).digest("hex");
 
 // get or create wallet (does NOT apply bonus)
 async function getWallet(username) {
@@ -370,7 +362,7 @@ async function grantSignupBonusIfNeeded(username) {
   return { ok: true, balance: w.balance };
 }
 
-// optional: simple users store for /register when Mongo exists; memory fallback
+// simple users store for /register when Mongo exists; memory fallback
 async function userFind(username) {
   const u = U(username);
   if (!u) return null;
@@ -429,7 +421,7 @@ app.get("/api/wallet/me", async (req, res) => {
 });
 
 /* ===================== Viewer session (unified login) ===================== */
-// Register (optional endpoint – safe to keep even if your UI logs in directly)
+// Register (optional endpoint – safe even if your UI logs in directly)
 app.post("/api/viewer/register", async (req, res) => {
   try {
     const name = U(req.body?.username || req.body?.user || "");
@@ -439,7 +431,7 @@ app.post("/api/viewer/register", async (req, res) => {
     const exists = await userFind(name);
     if (exists) return res.status(409).json({ error: "user_exists" });
 
-    const passHash = await bcrypt.hash(pwd, 10);
+    const passHash = hash(pwd);
     await userCreate(name, passHash);
 
     res.cookie("viewer", name, {
@@ -469,7 +461,7 @@ app.post("/api/viewer/login", async (req, res) => {
     // Optional: if a stored password exists, enforce it; otherwise allow legacy logins.
     const existing = await userFind(name);
     if (existing?.passHash) {
-      const ok = await bcrypt.compare(pwd, existing.passHash);
+      const ok = existing.passHash === hash(pwd);
       if (!ok) return res.status(401).json({ error: "invalid_login" });
     }
 
@@ -524,7 +516,7 @@ app.post("/api/deposits/:id/reject", verifyAdminToken, (req, res) => { const id 
 // accept client submit
 app.post("/api/lbx/orders", (req, res) => {
   const o = req.body || {};
-  o._id = o._id || ("ORD-" + Math.random().toString(36).slice(0,10).toUpperCase());
+  o._id = o._id || ("ORD-" + Math.random().toString(36).slice(2,10).toUpperCase());
   o.status = "pending";
   o.ts = o.ts || Date.now();
   memory.deposits.unshift(o);
@@ -1002,8 +994,8 @@ function buildTotalRoundsBandsDraft(matchCount){
 
   const bands = [
     { key:"A", from:min,       to:min+2,  label:`${min}–${min+2}.5` },
-    { key:"B", from:min+3,     to:min+5,  label:`${min+3}–${min+5.5}`.replace(".5.5",".5") },
-    { key:"C", from:min+6,     to:min+8,  label:`${min+6}–${min+8.5}`.replace(".5.5",".5") },
+    { key:"B", from:min+3,     to:min+5,  label:`${min+3}–${min+5}.5` },
+    { key:"C", from:min+6,     to:min+8,  label:`${min+6}–${min+8}.5` },
     { key:"D", from:Math.min(min+9, max), to:max, label:`${Math.min(min+9,max)}+` }
   ].filter(b => b.from <= b.to && b.from <= max);
 
@@ -1160,4 +1152,3 @@ app.listen(PORT, HOST, () => {
     console.warn("[DB] Continuing in memory mode.");
   }
 })();
-
