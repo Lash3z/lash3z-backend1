@@ -35,6 +35,15 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 
 const SIGNUP_BONUS = Number(process.env.SIGNUP_BONUS || 0);
 
+/* ===== Kick OAuth ENV ===== */
+const KICK_OAUTH_AUTHORIZE = "https://id.kick.com/oauth/authorize";
+const KICK_OAUTH_TOKEN     = "https://id.kick.com/oauth/token";
+const KICK_API_BASE        = "https://api.kick.com/public/v1";
+const KICK_CLIENT_ID       = process.env.KICK_CLIENT_ID || "";
+const KICK_CLIENT_SECRET   = process.env.KICK_CLIENT_SECRET || "";
+const KICK_REDIRECT_URI    = process.env.KICK_REDIRECT_URI || "https://lash3z.com/auth/kick/callback";
+const KICK_SCOPES          = (process.env.KICK_SCOPES || "user:read channel:read events:read").split(/\s+/).filter(Boolean);
+
 /* ===================== Paths ===================== */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -92,7 +101,11 @@ const memory = {
   betsPublished: [],
 
   // Feature flags
-  flags: { pvpEntriesOpen: true }
+  flags: { pvpEntriesOpen: true },
+
+  // Promo codes (memory fallback)
+  promoCodes: [],
+  promoRedemptions: [],
 };
 
 /* ===================== App ===================== */
@@ -208,7 +221,11 @@ app.get("/api/health", (req, res) => {
     adminLoginFile: ADMIN_LOGIN_FILE, hasAdminLogin: !!ADMIN_LOGIN_FILE,
     adminHubFile: ADMIN_HUB_FILE, hasAdminHub: !!ADMIN_HUB_FILE,
     db: !!globalThis.__dbReady,
-    adminBypass: DISABLE_ADMIN_AUTH
+    adminBypass: DISABLE_ADMIN_AUTH,
+    kick: {
+      configured: !!(KICK_CLIENT_ID && KICK_CLIENT_SECRET && KICK_REDIRECT_URI),
+      redirect: KICK_REDIRECT_URI
+    }
   });
 });
 app.get("/api/ping", (req,res)=> res.json({ ok:true, ts: Date.now() }));
@@ -270,6 +287,33 @@ app.use(express.static(PUBLIC_DIR, {
 const U = (s) => String(s || "").trim().toUpperCase();
 const nowISO = () => new Date().toISOString();
 const hash = (pwd) => crypto.createHash("sha256").update(String(pwd)).digest("hex");
+
+// ===== PROMO HELPERS (added) =====
+function normCode(s = "") {
+  return String(s).trim().toUpperCase().replace(/\s+/g, "");
+}
+function requireViewer(req, res, next) {
+  const cookieName = String(req.cookies?.viewer || "").toUpperCase();
+  const qName = String(req.query.viewer || "").toUpperCase();
+  const bName = String(req.body?.viewer || req.body?.username || "").toUpperCase();
+  const name = cookieName || qName || bName;
+  if (!name) return res.status(401).json({ ok: false, error: "LOGIN_REQUIRED" });
+  req.viewer = name;
+  next();
+}
+const __promoHits = new Map();
+function tinyRateLimit(windowMs = 10_000) {
+  return (req, res, next) => {
+    const k = `${req.ip || "ip"}:redeem`;
+    const now = Date.now();
+    const last = __promoHits.get(k) || 0;
+    if (now - last < windowMs) return res.status(429).json({ ok: false, error: "TOO_FAST" });
+    __promoHits.set(k, now);
+    next();
+  };
+}
+const PROMO_ALLOWED_AMOUNTS = new Set([5,10,15,20,25,30]);
+// ===== END PROMO HELPERS =====
 
 // get or create wallet (does NOT apply bonus)
 async function getWallet(username) {
@@ -421,7 +465,7 @@ app.get("/api/wallet/me", async (req, res) => {
 });
 
 /* ===================== Viewer session (unified login) ===================== */
-// Register (optional endpoint – safe even if your UI logs in directly)
+// Register
 app.post("/api/viewer/register", async (req, res) => {
   try {
     const name = U(req.body?.username || req.body?.user || "");
@@ -449,8 +493,7 @@ app.post("/api/viewer/register", async (req, res) => {
   }
 });
 
-// Normal player login; elevates to admin ONLY if username whitelisted AND password matches ADMIN_PASS.
-// Also makes sure signup bonus is granted once (and never removed).
+// Login
 app.post("/api/viewer/login", async (req, res) => {
   try {
     const name = String(req.body?.username || req.body?.user || "").trim().toUpperCase();
@@ -458,7 +501,6 @@ app.post("/api/viewer/login", async (req, res) => {
 
     if (!name) return res.status(400).json({ error: "username required" });
 
-    // Optional: if a stored password exists, enforce it; otherwise allow legacy logins.
     const existing = await userFind(name);
     if (existing?.passHash) {
       const ok = existing.passHash === hash(pwd);
@@ -476,7 +518,6 @@ app.post("/api/viewer/login", async (req, res) => {
     const elevate = isAdminName(name) && pwd === ADMIN_PASS;
     if (elevate) setAdminCookie(res, name);
 
-    // One-time bonus (no-op if already granted)
     await grantSignupBonusIfNeeded(name);
 
     const w = await getWallet(name);
@@ -506,6 +547,146 @@ app.post("/api/viewer/logout", (req, res) => {
   res.clearCookie("viewer", { path: "/" });
   res.clearCookie("admin_token", { path: "/" });
   res.json({ success: true });
+});
+
+/* ===================== Kick OAuth Linking ===================== */
+// Small PKCE store (swap to Redis if you scale horizontally)
+const pkceStore = new Map(); // state -> { verifier, ts, viewer }
+
+// helpers
+function b64url(buf) {
+  return buf.toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+}
+async function saveKickLink(username, profile /*, tokens */) {
+  const u = U(username);
+  if (!u) return;
+  if (globalThis.__dbReady) {
+    await globalThis.__db.collection("users").updateOne(
+      { username: u },
+      {
+        $setOnInsert: { username: u, createdAt: new Date() },
+        $set: {
+          kick: {
+            id: profile.id,
+            username: profile.username,
+            linkedAt: new Date()
+            // If you want tokens later: accessToken: tokens.access_token, refreshToken: tokens.refresh_token
+          }
+        }
+      },
+      { upsert: true }
+    );
+  } else {
+    const existing = memory.users.get(u) || { username: u, createdAt: new Date() };
+    existing.kick = { id: profile.id, username: profile.username, linkedAt: new Date() };
+    memory.users.set(u, existing);
+  }
+}
+
+async function getKickLink(username) {
+  const u = U(username);
+  if (!u) return null;
+  if (globalThis.__dbReady) {
+    const doc = await globalThis.__db.collection("users").findOne({ username: u }, { projection: { kick: 1 } });
+    return doc?.kick || null;
+  }
+  const doc = memory.users.get(u);
+  return doc?.kick || null;
+}
+
+async function clearKickLink(username) {
+  const u = U(username);
+  if (!u) return;
+  if (globalThis.__dbReady) {
+    await globalThis.__db.collection("users").updateOne({ username: u }, { $unset: { kick: "" } });
+  } else {
+    const doc = memory.users.get(u);
+    if (doc) delete doc.kick;
+  }
+}
+
+// Start OAuth (requires a logged-in viewer cookie)
+app.get("/auth/kick", requireViewer, (req, res) => {
+  if (!(KICK_CLIENT_ID && KICK_CLIENT_SECRET && KICK_REDIRECT_URI)) {
+    return res.status(500).send("Kick OAuth not configured.");
+  }
+  const state = b64url(crypto.randomBytes(16));
+  const verifier = b64url(crypto.randomBytes(32));
+  const challenge = b64url(crypto.createHash("sha256").update(verifier).digest());
+
+  pkceStore.set(state, { verifier, ts: Date.now(), viewer: req.viewer });
+
+  const url = new URL(KICK_OAUTH_AUTHORIZE);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("client_id", KICK_CLIENT_ID);
+  url.searchParams.set("redirect_uri", KICK_REDIRECT_URI);
+  url.searchParams.set("scope", KICK_SCOPES.join(" "));
+  url.searchParams.set("state", state);
+  url.searchParams.set("code_challenge", challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+
+  res.redirect(url.toString());
+});
+
+// OAuth callback
+app.get("/auth/kick/callback", async (req, res) => {
+  try {
+    const { code, state, error, error_description } = req.query;
+    if (error) return res.redirect(`/profile?kickError=${encodeURIComponent(error_description || error)}`);
+
+    const rec = pkceStore.get(state);
+    pkceStore.delete(state);
+    if (!rec) return res.redirect(`/profile?kickError=invalid_state`);
+
+    // Exchange code → tokens
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: KICK_CLIENT_ID,
+      client_secret: KICK_CLIENT_SECRET,
+      redirect_uri: KICK_REDIRECT_URI,
+      code_verifier: rec.verifier,
+      code
+    });
+
+    const tokRes = await fetch(KICK_OAUTH_TOKEN, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body
+    });
+    const tokens = await tokRes.json();
+    if (!tokRes.ok || !tokens?.access_token) {
+      return res.redirect(`/profile?kickError=token_exchange_failed`);
+    }
+
+    // Fetch current user profile from Kick
+    const meRes = await fetch(`${KICK_API_BASE}/users/me`, {
+      headers: { Authorization: `Bearer ${tokens.access_token}` }
+    });
+    const profile = await meRes.json();
+    if (!meRes.ok || !profile?.id) {
+      return res.redirect(`/profile?kickError=user_fetch_failed`);
+    }
+
+    // Persist link against the original viewer who started the flow
+    await saveKickLink(rec.viewer, profile /*, tokens*/);
+
+    res.redirect(`/profile?kickLinked=1`);
+  } catch (e) {
+    console.error("[Kick OAuth] callback error:", e);
+    res.redirect(`/profile?kickError=exception`);
+  }
+});
+
+// Link status (for the current viewer)
+app.get("/api/kick/status", requireViewer, async (req, res) => {
+  const k = await getKickLink(req.viewer);
+  res.json({ ok: true, linked: !!k, kick: k || null });
+});
+
+// Unlink
+app.post("/api/kick/unlink", requireViewer, async (req, res) => {
+  await clearKickLink(req.viewer);
+  res.json({ ok: true });
 });
 
 /* ===================== Deposits / Orders ===================== */
@@ -994,8 +1175,8 @@ function buildTotalRoundsBandsDraft(matchCount){
 
   const bands = [
     { key:"A", from:min,       to:min+2,  label:`${min}–${min+2}.5` },
-    { key:"B", from:min+3,     to:min+5,  label:`${min+3}–${min+5}.5` },
-    { key:"C", from:min+6,     to:min+8,  label:`${min+6}–${min+8}.5` },
+    { key:"B", from:min+3,     to:min+5,  label:`${min+3}–${min+5.5}` },
+    { key:"C", from:min+6,     to:min+8,  label:`${min+6}–${min+8.5}` },
     { key:"D", from:Math.min(min+9, max), to:max, label:`${Math.min(min+9,max)}+` }
   ].filter(b => b.from <= b.to && b.from <= max);
 
@@ -1118,6 +1299,214 @@ app.get("/api/bets/published", (req, res) => {
   res.json({ ok: true, items, ts: Date.now() });
 });
 
+/* ===================== LBX PROMO CODES — ADMIN ===================== */
+// Create one
+app.post("/api/admin/promo/create", verifyAdminToken, async (req, res) => {
+  try {
+    let { code, amount, maxRedemptions=1, perUserLimit=1, expiresAt=null, notes="" } = req.body || {};
+    amount = Number(amount);
+    maxRedemptions = Number(maxRedemptions);
+    perUserLimit = Number(perUserLimit);
+
+    if (!PROMO_ALLOWED_AMOUNTS.has(amount)) return res.status(400).json({ ok:false, error:"INVALID_AMOUNT" });
+    if (maxRedemptions < 1 || perUserLimit < 1) return res.status(400).json({ ok:false, error:"LIMITS_INVALID" });
+
+    const now = new Date();
+    const doc = {
+      code: normCode(code || `L3Z-${amount}-${crypto.randomBytes(4).toString("hex").slice(0,6).toUpperCase()}`),
+      amount,
+      maxRedemptions,
+      perUserLimit,
+      redeemedCount: 0,
+      active: true,
+      expiresAt: expiresAt ? new Date(expiresAt) : null,
+      createdBy: req.adminUser || "admin",
+      notes: String(notes || ""),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    if (globalThis.__dbReady) {
+      await globalThis.__db.collection("promo_codes").insertOne(doc);
+    } else {
+      if (memory.promoCodes.some(p => p.code === doc.code)) return res.status(409).json({ ok:false, error:"CODE_EXISTS" });
+      memory.promoCodes.unshift(doc);
+    }
+    res.json({ ok:true, code: doc.code, promo: doc });
+  } catch (e) {
+    if (e?.code === 11000) return res.status(409).json({ ok:false, error:"CODE_EXISTS" });
+    console.error("[promo/create]", e);
+    res.status(500).json({ ok:false, error:"SERVER" });
+  }
+});
+
+// Batch generate
+app.post("/api/admin/promo/generate", verifyAdminToken, async (req, res) => {
+  try {
+    let { prefix = "L3Z", amount, count, maxRedemptions=1, perUserLimit=1, expiresAt=null, notes="" } = req.body || {};
+    amount = Number(amount);
+    count = Math.min(5000, Number(count || 1));
+    if (!PROMO_ALLOWED_AMOUNTS.has(amount)) return res.status(400).json({ ok:false, error:"INVALID_AMOUNT" });
+    if (count < 1) return res.status(400).json({ ok:false, error:"COUNT_INVALID" });
+
+    const now = new Date();
+    const mkCode = () => `${normCode(prefix)}-${amount}-${crypto.randomBytes(6).toString("base64").replace(/[^A-Z0-9]/gi,"").slice(0,7).toUpperCase()}`;
+
+    if (globalThis.__dbReady) {
+      const pc = globalThis.__db.collection("promo_codes");
+      const docs = Array.from({ length: count }).map(() => ({
+        code: mkCode(),
+        amount,
+        maxRedemptions: Number(maxRedemptions),
+        perUserLimit: Number(perUserLimit),
+        redeemedCount: 0,
+        active: true,
+        expiresAt: expiresAt ? new Date(expiresAt) : null,
+        createdBy: req.adminUser || "admin",
+        notes: String(notes || ""),
+        createdAt: now,
+        updatedAt: now,
+      }));
+      await pc.insertMany(docs, { ordered: false });
+      return res.json({ ok:true, generated: docs.length, sample: docs.slice(0,5).map(d=>d.code) });
+    } else {
+      const docs = [];
+      for (let i=0;i<count;i++){
+        let c; do { c = mkCode(); } while (memory.promoCodes.some(p => p.code === c));
+        docs.push({
+          code: c, amount,
+          maxRedemptions: Number(maxRedemptions),
+          perUserLimit: Number(perUserLimit),
+          redeemedCount: 0,
+          active: true,
+          expiresAt: expiresAt ? new Date(expiresAt) : null,
+          createdBy: req.adminUser || "admin",
+          notes: String(notes || ""),
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+      memory.promoCodes.unshift(...docs);
+      return res.json({ ok:true, generated: docs.length, sample: docs.slice(0,5).map(d=>d.code) });
+    }
+  } catch (e) {
+    console.error("[promo/generate]", e);
+    res.status(500).json({ ok:false, error:"SERVER" });
+  }
+});
+
+// List / disable
+app.get("/api/admin/promo/list", verifyAdminToken, async (req, res) => {
+  const only = "active" in req.query ? (req.query.active === "1") : null;
+  if (globalThis.__dbReady) {
+    const q = only === null ? {} : { active: only };
+    const items = await globalThis.__db.collection("promo_codes").find(q).sort({ createdAt: -1 }).limit(500).toArray();
+    return res.json({ ok:true, items });
+  } else {
+    let items = [...memory.promoCodes];
+    if (only !== null) items = items.filter(p => !!p.active === only);
+    return res.json({ ok:true, items });
+  }
+});
+app.post("/api/admin/promo/disable", verifyAdminToken, async (req, res) => {
+  const code = normCode(req.body?.code || "");
+  if (!code) return res.status(400).json({ ok:false, error:"CODE_REQUIRED" });
+  if (globalThis.__dbReady) {
+    const r = await globalThis.__db.collection("promo_codes").updateOne({ code }, { $set: { active:false, updatedAt: new Date() } });
+    return res.json({ ok:true, modified: r.modifiedCount });
+  } else {
+    const i = memory.promoCodes.findIndex(p => p.code === code);
+    if (i >= 0) memory.promoCodes[i].active = false;
+    return res.json({ ok:true, modified: i >= 0 ? 1 : 0 });
+  }
+});
+
+/* ===================== LBX PROMO CODES — USER ===================== */
+app.post("/api/promo/redeem", requireViewer, tinyRateLimit(), async (req, res) => {
+  try {
+    const code = normCode(req.body?.code || "");
+    if (!code) return res.status(400).json({ ok:false, error:"CODE_REQUIRED" });
+    const username = req.viewer;
+
+    const now = new Date();
+
+    if (globalThis.__dbReady) {
+      const pc = globalThis.__db.collection("promo_codes");
+      const pr = globalThis.__db.collection("promo_redemptions");
+
+      const promo = await pc.findOne({ code });
+      if (!promo || !promo.active) return res.status(404).json({ ok:false, error:"INVALID_CODE" });
+      if (promo.expiresAt && promo.expiresAt < now) return res.status(410).json({ ok:false, error:"EXPIRED" });
+      if (promo.redeemedCount >= promo.maxRedemptions) return res.status(409).json({ ok:false, error:"DEPLETED" });
+
+      const prior = await pr.countDocuments({ code, username });
+      if (prior >= (promo.perUserLimit || 1)) return res.status(409).json({ ok:false, error:"PER_USER_LIMIT" });
+
+      try {
+        await pr.insertOne({ code, username, amount: Number(promo.amount||0), createdAt: now });
+      } catch {
+        return res.status(409).json({ ok:false, error:"ALREADY_REDEEMED" });
+      }
+
+      const up = await pc.updateOne(
+        { _id: promo._id, redeemedCount: { $lt: promo.maxRedemptions } },
+        { $inc: { redeemedCount: 1 }, $set: { updatedAt: now } }
+      );
+      if (up.modifiedCount !== 1) {
+        await pr.deleteOne({ code, username }); // rollback
+        return res.status(409).json({ ok:false, error:"DEPLETED" });
+      }
+
+      const credited = await adjustWallet(username, Number(promo.amount||0), `promo:${code}`);
+      if (!credited?.ok) {
+        await pc.updateOne({ _id: promo._id }, { $inc: { redeemedCount: -1 } });
+        await pr.deleteOne({ code, username });
+        return res.status(500).json({ ok:false, error:"CREDIT_FAILED" });
+      }
+
+      return res.json({ ok:true, added: Number(promo.amount||0), code, balance: credited.balance });
+    }
+
+    // ===== MEMORY MODE =====
+    const promo = memory.promoCodes.find(p => p.code === code);
+    if (!promo || !promo.active) return res.status(404).json({ ok:false, error:"INVALID_CODE" });
+    if (promo.expiresAt && promo.expiresAt < now) return res.status(410).json({ ok:false, error:"EXPIRED" });
+
+    if (promo.redeemedCount >= promo.maxRedemptions) return res.status(409).json({ ok:false, error:"DEPLETED" });
+
+    const userClaims = memory.promoRedemptions.filter(r => r.code === code && r.username === username).length;
+    if (userClaims >= (promo.perUserLimit || 1)) return res.status(409).json({ ok:false, error:"PER_USER_LIMIT" });
+
+    // reserve
+    promo.redeemedCount++;
+    memory.promoRedemptions.unshift({ code, username, amount: Number(promo.amount||0), createdAt: now });
+
+    const credited = await adjustWallet(username, Number(promo.amount||0), `promo:${code}`);
+    if (!credited?.ok) {
+      // rollback
+      promo.redeemedCount = Math.max(0, promo.redeemedCount - 1);
+      memory.promoRedemptions = memory.promoRedemptions.filter(r => !(r.code === code && r.username === username));
+      return res.status(500).json({ ok:false, error:"CREDIT_FAILED" });
+    }
+    return res.json({ ok:true, added: Number(promo.amount||0), code, balance: credited.balance });
+  } catch (e) {
+    console.error("[promo/redeem]", e);
+    res.status(500).json({ ok:false, error:"SERVER" });
+  }
+});
+
+app.get("/api/promo/my-redemptions", requireViewer, async (req, res) => {
+  const username = req.viewer;
+  if (globalThis.__dbReady) {
+    const rows = await globalThis.__db.collection("promo_redemptions")
+      .find({ username }).sort({ createdAt: -1 }).limit(200).toArray();
+    return res.json({ ok:true, items: rows });
+  } else {
+    const rows = memory.promoRedemptions.filter(r => r.username === username);
+    return res.json({ ok:true, items: rows });
+  }
+});
+
 /* ===================== 404 / Error ===================== */
 app.use((req, res) => res.status(404).send("Not found."));
 app.use((err, req, res, next) => {
@@ -1132,6 +1521,7 @@ app.listen(PORT, HOST, () => {
   console.log(`[Server] HOME_INDEX=${HOME_INDEX} hasHome=${HAS_HOME}`);
   console.log(`[Server] ADMIN_LOGIN_FILE=${ADMIN_LOGIN_FILE || "(none)"} | ADMIN_HUB_FILE=${ADMIN_HUB_FILE || "(none)"}`);
   console.log(`[Server] Admin bypass: ${DISABLE_ADMIN_AUTH ? "ON" : "OFF"}`);
+  console.log(`[Kick] OAuth configured=${!!(KICK_CLIENT_ID && KICK_CLIENT_SECRET && KICK_REDIRECT_URI)} redirect=${KICK_REDIRECT_URI}`);
 });
 
 (async () => {
@@ -1146,6 +1536,22 @@ app.listen(PORT, HOST, () => {
     globalThis.__db = client.db(MONGO_DB);
     globalThis.__dbReady = true;
     console.log(`[DB] Connected to MongoDB: ${MONGO_DB}`);
+
+    // ===== promo indexes =====
+    async function ensurePromoIndexes(db) {
+      try {
+        const pc = db.collection("promo_codes");
+        const pr = db.collection("promo_redemptions");
+        await pc.createIndex({ code: 1 }, { unique: true });
+        await pc.createIndex({ active: 1, expiresAt: 1 });
+        await pr.createIndex({ code: 1, username: 1 }, { unique: true });
+        await pr.createIndex({ createdAt: 1 });
+        console.log("[DB] promo indexes ensured");
+      } catch (e) {
+        console.warn("[DB] promo index setup failed:", e?.message || e);
+      }
+    }
+    await ensurePromoIndexes(globalThis.__db);
   } catch (err) {
     console.error("[DB] Mongo connection failed:", err?.message || err);
     if (!ALLOW_MEMORY_FALLBACK) { console.error("[DB] ALLOW_MEMORY_FALLBACK=false — exiting"); process.exit(1); }
