@@ -1,9 +1,11 @@
 // server.js — full ESM build (TOTAL ROUNDS BANDS from Battleground; Bets drafts/publish)
+// + Wallet persistence (Mongo or memory) and one-time SIGNUP_BONUS
 import fs from "fs";
 import path from "path";
 import express from "express";
 import cookieParser from "cookie-parser";
 import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 import { fileURLToPath } from "url";
 import { MongoClient, ObjectId } from "mongodb";
 import dotenv from "dotenv";
@@ -16,7 +18,6 @@ const PORT = Number(process.env.PORT) || 3000;
 const NODE_ENV = process.env.NODE_ENV || "production";
 
 const ADMIN_USER   = (process.env.ADMIN_USER || "lash3z").toLowerCase();
-// defaults so admin gate & unified login both work in dev
 const ADMIN_PASS   = process.env.ADMIN_PASS   || "Lash3z777";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "dev_admin_secret";
 const JWT_SECRET   = process.env.SECRET || ADMIN_SECRET;
@@ -31,6 +32,8 @@ const ALLOW_MEMORY_FALLBACK = (process.env.ALLOW_MEMORY_FALLBACK || "true") === 
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s=>s.trim()).filter(Boolean);
+
+const SIGNUP_BONUS = Number(process.env.SIGNUP_BONUS || 0);
 
 if (
   NODE_ENV === "production" &&
@@ -83,7 +86,8 @@ const memory = {
     jackpotPerSubAUD: 2.50, jackpotCurrency: "AUD", depositContributesJackpot: false
   },
   events: [],
-  wallets: {},
+  wallets: {},        // legacy in-memory wallets (used if DB is unavailable)
+  users: new Map(),   // in-memory users (only if DB is unavailable)
   raffles: [],
   claims: [],
   deposits: [],
@@ -268,76 +272,234 @@ app.use(express.static(PUBLIC_DIR, {
   }
 }));
 
-/* ===================== Minimal APIs you had ===================== */
-app.get("/api/jackpot", (req, res) => {
-  res.json({ amount: Number(memory.jackpot.amount || 0), month: memory.jackpot.month, perSubAUD: memory.jackpot.perSubAUD });
-});
-app.post("/api/jackpot/adjust", verifyAdminToken, (req, res) => {
-  const d = Number(req.body?.delta || 0);
-  memory.jackpot.amount = Number(memory.jackpot.amount || 0) + d;
-  memory.events.unshift({ ts: Date.now(), type: "JACKPOT_ADJUST", user: req.adminUser, quantity: d, recipients: [], applied: true });
-  res.json({ success: true, amount: memory.jackpot.amount });
-});
-app.get("/api/events/rules", verifyAdminToken, (req, res) => res.json({ rules: memory.rules }));
-app.put("/api/events/rules", verifyAdminToken, (req, res) => { memory.rules = { ...memory.rules, ...(req.body || {}) }; res.json({ success: true, rules: memory.rules }); });
-app.get("/api/events/recent", verifyAdminToken, (req, res) => { const limit = Math.max(1, Math.min(500, Number(req.query.limit || 200))); res.json({ events: memory.events.slice(0, limit) }); });
+/* ======================================================================== */
+/* ===================== WALLET / USER HELPERS (NEW) ====================== */
+/* ======================================================================== */
 
-/* ===================== Wallet (+ shim) ===================== */
+const U = (s) => String(s || "").trim().toUpperCase();
+const nowISO = () => new Date().toISOString();
+
+// get or create wallet (does NOT apply bonus)
+async function getWallet(username) {
+  const user = U(username);
+  if (!user) return { username: "", balance: 0 };
+
+  if (globalThis.__dbReady) {
+    const col = globalThis.__db.collection("wallets");
+    const found = await col.findOne({ username: user });
+    if (found) {
+      return {
+        username: user,
+        balance: Number(found.balance || 0),
+        signupBonusGrantedAt: found.signupBonusGrantedAt ?? null
+      };
+    }
+    const fresh = { username: user, balance: 0, ledger: [], signupBonusGrantedAt: null };
+    await col.insertOne(fresh);
+    return { username: user, balance: 0, signupBonusGrantedAt: null };
+  }
+
+  // memory
+  const w = memory.wallets[user] || { balance: 0, signupBonusGrantedAt: null, ledger: [] };
+  memory.wallets[user] = w;
+  return { username: user, balance: Number(w.balance || 0), signupBonusGrantedAt: w.signupBonusGrantedAt };
+}
+
+// credit/debit
+async function adjustWallet(username, delta, reason = "adjust") {
+  const user = U(username);
+  const amount = Number(delta || 0);
+  if (!user || !Number.isFinite(amount)) return { ok: false, error: "bad_params" };
+
+  if (globalThis.__dbReady) {
+    const col = globalThis.__db.collection("wallets");
+    const tx  = { ts: nowISO(), delta: amount, reason };
+    const r = await col.findOneAndUpdate(
+      { username: user },
+      {
+        $setOnInsert: { username: user, balance: 0, ledger: [], signupBonusGrantedAt: null },
+        $inc: { balance: amount },
+        $push: { ledger: tx }
+      },
+      { upsert: true, returnDocument: "after" }
+    );
+    return { ok: true, balance: Number(r.value?.balance || 0) };
+  }
+
+  // memory
+  const w = memory.wallets[user] || { balance: 0, ledger: [], signupBonusGrantedAt: null };
+  w.balance = Number(w.balance || 0) + amount;
+  w.ledger.push({ ts: nowISO(), delta: amount, reason });
+  memory.wallets[user] = w;
+  return { ok: true, balance: w.balance };
+}
+
+// grant one-time signup bonus
+async function grantSignupBonusIfNeeded(username) {
+  const user = U(username);
+  const bonus = SIGNUP_BONUS;
+  if (!user || !bonus) return { ok: true, skipped: true };
+
+  if (globalThis.__dbReady) {
+    const col = globalThis.__db.collection("wallets");
+    const existing = await col.findOne({ username: user }, { projection: { signupBonusGrantedAt: 1, balance: 1 } });
+    if (existing?.signupBonusGrantedAt) {
+      return { ok: true, skipped: true, balance: Number(existing.balance || 0) };
+    }
+    const tx = { ts: nowISO(), delta: bonus, reason: "signup_bonus" };
+    const r = await col.findOneAndUpdate(
+      { username: user },
+      {
+        $setOnInsert: { username: user, balance: 0, ledger: [] },
+        $inc: { balance: bonus },
+        $set: { signupBonusGrantedAt: new Date() },
+        $push: { ledger: tx }
+      },
+      { upsert: true, returnDocument: "after" }
+    );
+    return { ok: true, balance: Number(r.value?.balance || 0) };
+  }
+
+  // memory
+  const w = memory.wallets[user] || { balance: 0, ledger: [], signupBonusGrantedAt: null };
+  if (w.signupBonusGrantedAt) return { ok: true, skipped: true, balance: Number(w.balance || 0) };
+  w.balance = Number(w.balance || 0) + bonus;
+  w.signupBonusGrantedAt = new Date();
+  w.ledger.push({ ts: nowISO(), delta: bonus, reason: "signup_bonus" });
+  memory.wallets[user] = w;
+  return { ok: true, balance: w.balance };
+}
+
+// optional: simple users store for /register when Mongo exists; memory fallback
+async function userFind(username) {
+  const u = U(username);
+  if (!u) return null;
+  if (globalThis.__dbReady) {
+    return await globalThis.__db.collection("users").findOne({ username: u });
+  }
+  return memory.users.get(u) || null;
+}
+async function userCreate(username, passHash) {
+  const u = U(username);
+  const doc = { username: u, passHash, createdAt: new Date() };
+  if (globalThis.__dbReady) {
+    await globalThis.__db.collection("users").insertOne(doc);
+  } else {
+    memory.users.set(u, doc);
+  }
+  return doc;
+}
+
+/* ===================== Minimal APIs you had ===================== */
 function walletAdjustHandler(req, res){
   const u = String(req.body?.username || req.body?.user || req.body?.name || "").toUpperCase();
   const delta = Number(req.body?.delta || req.body?.amount || 0);
   if (!u) return res.status(400).json({ error: "username required" });
-  const w = memory.wallets[u] || { balance: 0 }; w.balance = Number(w.balance) + delta; memory.wallets[u] = w;
-  res.json({ success: true, wallet: w, balance: Number(w.balance||0) });
+  adjustWallet(u, delta, "admin_adjust")
+    .then(r => res.json({ success: true, balance: r.balance }))
+    .catch(() => res.status(500).json({ error: "failed" }));
 }
 app.post("/api/wallet/adjust", verifyAdminToken, walletAdjustHandler);
 app.post("/api/admin/wallet/adjust", verifyAdminToken, walletAdjustHandler);
 
-app.post("/api/wallet/credit", verifyAdminToken, (req, res) => {
+app.post("/api/wallet/credit", verifyAdminToken, async (req, res) => {
   const u = String(req.body?.username || req.body?.user || req.body?.name || "").toUpperCase();
   const amount = Number(req.body?.amount || 0);
   if (!u) return res.status(400).json({ error: "username required" });
-  const w = memory.wallets[u] || { balance: 0 }; w.balance = Number(w.balance) + amount; memory.wallets[u] = w;
-  res.json({ success: true, wallet: w });
+  try {
+    const r = await adjustWallet(u, amount, "admin_credit");
+    res.json({ success: true, balance: r.balance });
+  } catch {
+    res.status(500).json({ error: "failed" });
+  }
 });
-app.get("/api/wallet/balance", verifyAdminToken, (req, res) => { const u = String(req.query.user || "").toUpperCase(); const w = memory.wallets[u] || { balance: 0 }; res.json({ balance: Number(w.balance || 0) }); });
+app.get("/api/wallet/balance", verifyAdminToken, async (req, res) => {
+  const u = String(req.query.user || "").toUpperCase();
+  const w = await getWallet(u);
+  res.json({ balance: Number(w.balance || 0) });
+});
 
-// ✅ public wallet read; now defaults to the viewer cookie, falls back to ?viewer
-app.get("/api/wallet/me", (req, res) => {
+// ✅ public wallet read; now uses persistent wallet and viewer cookie
+app.get("/api/wallet/me", async (req, res) => {
   const cookieName = String(req.cookies?.viewer || "").toUpperCase();
   const qName      = String(req.query.viewer || "").toUpperCase();
   const username   = cookieName || qName || "";
-  const w = memory.wallets[username] || { balance: 0 };
+  const w = await getWallet(username);
   res.json({ username, wallet: { balance: Number(w.balance || 0) } });
 });
 
 /* ===================== Viewer session (unified login) ===================== */
-// Normal player login; elevates to admin ONLY if username whitelisted AND password matches ADMIN_PASS.
-app.post("/api/viewer/login", (req, res) => {
-  const name = String(req.body?.username || req.body?.user || "").trim().toUpperCase();
-  const pwd  = String(req.body?.password || "");
-  if (!name) return res.status(400).json({ error: "username required" });
+// Register (optional endpoint – safe to keep even if your UI logs in directly)
+app.post("/api/viewer/register", async (req, res) => {
+  try {
+    const name = U(req.body?.username || req.body?.user || "");
+    const pwd  = String(req.body?.password || "");
+    if (!name || !pwd) return res.status(400).json({ error: "missing_credentials" });
 
-  res.cookie("viewer", name, {
-    httpOnly: false,
-    sameSite: "lax",
-    secure: NODE_ENV === "production",
-    maxAge: 1000 * 60 * 60 * 24 * 30, // 30d
-    path: "/",
-  });
+    const exists = await userFind(name);
+    if (exists) return res.status(409).json({ error: "user_exists" });
 
-  const elevate = isAdminName(name) && pwd === ADMIN_PASS;
-  if (elevate) setAdminCookie(res, name);
+    const passHash = await bcrypt.hash(pwd, 10);
+    await userCreate(name, passHash);
 
-  const w = memory.wallets[name] || { balance: 0 };
-  res.json({ success: true, username: name, admin: elevate, wallet: { balance: Number(w.balance||0) } });
+    res.cookie("viewer", name, {
+      httpOnly: false, sameSite: "lax",
+      secure: NODE_ENV === "production",
+      maxAge: 1000*60*60*24*30, path: "/",
+    });
+
+    await grantSignupBonusIfNeeded(name);
+    const w = await getWallet(name);
+    res.json({ success: true, username: name, wallet: { balance: Number(w.balance||0) } });
+  } catch (e) {
+    console.error("[register] error", e);
+    res.status(500).json({ error: "server_error" });
+  }
 });
 
-app.get("/api/viewer/me", (req, res) => {
+// Normal player login; elevates to admin ONLY if username whitelisted AND password matches ADMIN_PASS.
+// Also makes sure signup bonus is granted once (and never removed).
+app.post("/api/viewer/login", async (req, res) => {
+  try {
+    const name = String(req.body?.username || req.body?.user || "").trim().toUpperCase();
+    const pwd  = String(req.body?.password || "");
+
+    if (!name) return res.status(400).json({ error: "username required" });
+
+    // Optional: if a stored password exists, enforce it; otherwise allow legacy logins.
+    const existing = await userFind(name);
+    if (existing?.passHash) {
+      const ok = await bcrypt.compare(pwd, existing.passHash);
+      if (!ok) return res.status(401).json({ error: "invalid_login" });
+    }
+
+    res.cookie("viewer", name, {
+      httpOnly: false,
+      sameSite: "lax",
+      secure: NODE_ENV === "production",
+      maxAge: 1000 * 60 * 60 * 24 * 30, // 30d
+      path: "/",
+    });
+
+    const elevate = isAdminName(name) && pwd === ADMIN_PASS;
+    if (elevate) setAdminCookie(res, name);
+
+    // One-time bonus (no-op if already granted)
+    await grantSignupBonusIfNeeded(name);
+
+    const w = await getWallet(name);
+    res.json({ success: true, username: name, admin: elevate, wallet: { balance: Number(w.balance||0) } });
+  } catch (e) {
+    console.error("[login] error", e);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+app.get("/api/viewer/me", async (req, res) => {
   const cookieName = String(req.cookies?.viewer || "").toUpperCase();
   const qName = String(req.query.viewer || "").toUpperCase();
   const username = cookieName || qName || "";
-  const w = memory.wallets[username] || { balance: 0 };
+  const w = await getWallet(username);
 
   const admin = hasValidAdminCookie(req); // don't auto-elevate here
   res.json({
@@ -362,7 +524,7 @@ app.post("/api/deposits/:id/reject", verifyAdminToken, (req, res) => { const id 
 // accept client submit
 app.post("/api/lbx/orders", (req, res) => {
   const o = req.body || {};
-  o._id = o._id || ("ORD-" + Math.random().toString(36).slice(2,10).toUpperCase());
+  o._id = o._id || ("ORD-" + Math.random().toString(36).slice(0,10).toUpperCase());
   o.status = "pending";
   o.ts = o.ts || Date.now();
   memory.deposits.unshift(o);
@@ -694,7 +856,7 @@ app.post("/api/pvp/bracket/progress", verifyAdminToken, async (req, res) => {
     }
     if (b.bracket.cursor && b.bracket.cursor.phase===phase && (b.bracket.cursor.roundIndex|0)===rIdx && (b.bracket.cursor.matchIndex|0)===mIdx){
       const nxt = (function findNextPending(br){
-        const order = [["east"],["west"],["finals"]];
+        const order = [["east"],["west"],["finals"]]];
         for (const [ph] of order){
           const sideArr2 = br[ph]; if (!sideArr2) continue;
           for (let r=0;r<sideArr2.length;r++){
@@ -840,8 +1002,8 @@ function buildTotalRoundsBandsDraft(matchCount){
 
   const bands = [
     { key:"A", from:min,       to:min+2,  label:`${min}–${min+2}.5` },
-    { key:"B", from:min+3,     to:min+5,  label:`${min+3}–${min+5}.5` },
-    { key:"C", from:min+6,     to:min+8,  label:`${min+6}–${min+8}.5` },
+    { key:"B", from:min+3,     to:min+5,  label:`${min+3}–${min+5.5}`.replace(".5.5",".5") },
+    { key:"C", from:min+6,     to:min+8,  label:`${min+6}–${min+8.5}`.replace(".5.5",".5") },
     { key:"D", from:Math.min(min+9, max), to:max, label:`${Math.min(min+9,max)}+` }
   ].filter(b => b.from <= b.to && b.from <= max);
 
