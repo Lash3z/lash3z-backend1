@@ -856,7 +856,7 @@ app.post("/api/pvp/bracket/progress", verifyAdminToken, async (req, res) => {
     }
     if (b.bracket.cursor && b.bracket.cursor.phase===phase && (b.bracket.cursor.roundIndex|0)===rIdx && (b.bracket.cursor.matchIndex|0)===mIdx){
       const nxt = (function findNextPending(br){
-        const order = [["east"],["west"],["finals"]]];
+        const order = [["east"],["west"],["finals"]];
         for (const [ph] of order){
           const sideArr2 = br[ph]; if (!sideArr2) continue;
           for (let r=0;r<sideArr2.length;r++){
@@ -1160,3 +1160,4 @@ app.listen(PORT, HOST, () => {
     console.warn("[DB] Continuing in memory mode.");
   }
 })();
+
