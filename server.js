@@ -106,6 +106,9 @@ const memory = {
   // Promo codes (memory fallback)
   promoCodes: [],
   promoRedemptions: [],
+
+  // Monthly leaderboard buckets (memory fallback)
+  monthlyLB: {}   // { "YYYY-MM": { USER: { ...points } } }
 };
 
 /* ===================== App ===================== */
@@ -287,6 +290,9 @@ app.use(express.static(PUBLIC_DIR, {
 const U = (s) => String(s || "").trim().toUpperCase();
 const nowISO = () => new Date().toISOString();
 const hash = (pwd) => crypto.createHash("sha256").update(String(pwd)).digest("hex");
+
+// Leaderboard helpers
+const currentMonth = () => new Date().toISOString().slice(0, 7); // "YYYY-MM"
 
 // ===== PROMO HELPERS (added) =====
 function normCode(s = "") {
@@ -765,32 +771,137 @@ app.post("/api/prize-claims/:id/status", verifyAdminToken, (req, res) => {
   res.json({ success: true });
 });
 
-/* ===================== Leaderboard ===================== */
+/* ===================== Leaderboard (monthly + lifetime) ===================== */
 app.post("/api/leaderboard/upsert", verifyAdminToken, async (req, res) => {
   const user = String(req.body?.user || req.body?.username || "").toUpperCase();
-  const delta = Number(req.body?.deltaTournamentPoints || 0);
-  const actions = Array.isArray(req.body?.actions) ? req.body.actions : [];
   if (!user) return res.status(400).json({ error: "username required" });
+
+  // Which category? default tournament
+  const mode = String(req.body?.mode || "tournament").toLowerCase();
+  const fieldMap = {
+    tournament: "tournamentPoints",
+    bonus:      "bonusHuntPoints",
+    pvp:        "pvpPoints",
+    lucky7:     "lucky7Points",
+  };
+  const field = fieldMap[mode] || "tournamentPoints";
+
+  // Delta (keep backward compat with deltaTournamentPoints)
+  const delta = Number(
+    req.body?.delta ??
+    req.body?.deltaTournamentPoints ??
+    0
+  );
+  const actions = Array.isArray(req.body?.actions) ? req.body.actions : [];
+  const month = String(req.body?.month || currentMonth());
 
   try {
     if (globalThis.__dbReady) {
-      const col = globalThis.__db.collection("profiles");
-      const r = await col.findOneAndUpdate(
+      const db = globalThis.__db;
+
+      // 1) Cumulative lifetime in profiles
+      const profiles = db.collection("profiles");
+      const cumInc = { [field]: delta };
+      const r1 = await profiles.findOneAndUpdate(
         { username: user },
         {
-          $setOnInsert: { username: user, tournamentPoints: 0, bonusHuntPoints: 0 },
-          $inc: { tournamentPoints: delta },
-          $push: { history: { ts: new Date(), mode: "Lucky7", added: delta, actions } }
+          $setOnInsert: {
+            username: user,
+            tournamentPoints: 0,
+            bonusHuntPoints:  0,
+            pvpPoints:        0,
+            lucky7Points:     0,
+            history: []
+          },
+          $inc: cumInc,
+          $push: { history: { ts: new Date(), mode, added: delta, actions } }
         },
         { upsert: true, returnDocument: "after" }
       );
-      return res.json({ success: true, profile: r.value });
+
+      // 2) Monthly bucket in leaderboard_monthly
+      const monthly = db.collection("leaderboard_monthly");
+      const r2 = await monthly.findOneAndUpdate(
+        { username: user, month },
+        {
+          $setOnInsert: {
+            username: user,
+            month,
+            tournamentPoints: 0,
+            bonusHuntPoints:  0,
+            pvpPoints:        0,
+            lucky7Points:     0,
+            totalPoints:      0,
+            history: []
+          },
+          $inc: { [field]: delta, totalPoints: delta },
+          $push: { history: { ts: new Date(), mode, added: delta, actions } }
+        },
+        { upsert: true, returnDocument: "after" }
+      );
+
+      return res.json({
+        success: true,
+        cumulative: {
+          username: r1.value.username,
+          tournamentPoints: Number(r1.value.tournamentPoints || 0),
+          bonusHuntPoints:  Number(r1.value.bonusHuntPoints  || 0),
+          pvpPoints:        Number(r1.value.pvpPoints        || 0),
+          lucky7Points:     Number(r1.value.lucky7Points     || 0)
+        },
+        monthly: {
+          username: r2.value.username,
+          month: r2.value.month,
+          tournamentPoints: Number(r2.value.tournamentPoints || 0),
+          bonusHuntPoints:  Number(r2.value.bonusHuntPoints  || 0),
+          pvpPoints:        Number(r2.value.pvpPoints        || 0),
+          lucky7Points:     Number(r2.value.lucky7Points     || 0),
+          totalPoints:      Number(r2.value.totalPoints      || 0)
+        }
+      });
     } else {
-      const p = memory.profiles[user] || { username: user, tournamentPoints: 0, bonusHuntPoints: 0, history: [] };
-      p.tournamentPoints = Number(p.tournamentPoints || 0) + delta;
-      p.history.unshift({ ts: Date.now(), mode: "Lucky7", added: delta, actions });
+      // ===== Memory fallback =====
+      // cumulative
+      const p = memory.profiles[user] || {
+        username: user,
+        tournamentPoints: 0,
+        bonusHuntPoints:  0,
+        pvpPoints:        0,
+        lucky7Points:     0,
+        history: []
+      };
+      p[field] = Number(p[field] || 0) + delta;
+      p.history.unshift({ ts: Date.now(), mode, added: delta, actions });
       memory.profiles[user] = p;
-      return res.json({ success: true, profile: p });
+
+      // monthly
+      memory.monthlyLB[month] = memory.monthlyLB[month] || {};
+      const mrec = memory.monthlyLB[month][user] || {
+        username: user,
+        month,
+        tournamentPoints: 0,
+        bonusHuntPoints:  0,
+        pvpPoints:        0,
+        lucky7Points:     0,
+        totalPoints:      0,
+        history: []
+      };
+      mrec[field] = Number(mrec[field] || 0) + delta;
+      mrec.totalPoints = Number(mrec.totalPoints || 0) + delta;
+      mrec.history.unshift({ ts: Date.now(), mode, added: delta, actions });
+      memory.monthlyLB[month][user] = mrec;
+
+      return res.json({
+        success: true,
+        cumulative: {
+          username: p.username,
+          tournamentPoints: p.tournamentPoints,
+          bonusHuntPoints:  p.bonusHuntPoints,
+          pvpPoints:        p.pvpPoints,
+          lucky7Points:     p.lucky7Points
+        },
+        monthly: mrec
+      });
     }
   } catch (e) {
     console.error("[LEADERBOARD] upsert failed", e);
@@ -798,6 +909,136 @@ app.post("/api/leaderboard/upsert", verifyAdminToken, async (req, res) => {
   }
 });
 app.post("/api/admin/leaderboard/rebuild", verifyAdminToken, (req,res)=> res.json({ success:true }));
+
+// Read: monthly leaderboard (auto "resets" by month bucket)
+app.get("/api/leaderboard/monthly", async (req, res) => {
+  const month = String(req.query.month || currentMonth());
+  const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 200)));
+
+  try {
+    if (globalThis.__dbReady) {
+      const col = globalThis.__db.collection("leaderboard_monthly");
+      const rows = await col.find({ month })
+        .project({
+          _id: 0, username: 1, month: 1,
+          tournamentPoints: 1, bonusHuntPoints: 1, pvpPoints: 1, lucky7Points: 1,
+          totalPoints: 1
+        })
+        .sort({ totalPoints: -1, tournamentPoints: -1, bonusHuntPoints: -1, pvpPoints: -1, lucky7Points: -1, username: 1 })
+        .limit(limit)
+        .toArray();
+
+      // dense rank
+      let lastKey = null, rank = 0;
+      const ranked = rows.map((r, i) => {
+        const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
+        if (key !== lastKey) { rank = i + 1; lastKey = key; }
+        return { rank, ...r };
+      });
+
+      return res.json({ month, items: ranked });
+    }
+
+    // memory fallback
+    const bucket = memory.monthlyLB[month] || {};
+    const items = Object.values(bucket)
+      .sort((a, b) =>
+        (b.totalPoints || 0) - (a.totalPoints || 0) ||
+        (b.tournamentPoints || 0) - (a.tournamentPoints || 0) ||
+        (b.bonusHuntPoints || 0) - (a.bonusHuntPoints || 0) ||
+        (b.pvpPoints || 0) - (a.pvpPoints || 0) ||
+        (b.lucky7Points || 0) - (a.lucky7Points || 0) ||
+        a.username.localeCompare(b.username)
+      )
+      .slice(0, limit);
+
+    let lastKey = null, rank = 0;
+    const ranked = items.map((r, i) => {
+      const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
+      if (key !== lastKey) { rank = i + 1; lastKey = key; }
+      return { rank, ...r };
+    });
+
+    return res.json({ month, items: ranked });
+  } catch (e) {
+    console.error("[LEADERBOARD] monthly list failed", e);
+    return res.status(500).json({ error: "failed" });
+  }
+});
+
+// Read: lifetime (overall) leaderboard
+app.get("/api/leaderboard/overall", async (req, res) => {
+  const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 200)));
+
+  try {
+    if (globalThis.__dbReady) {
+      const col = globalThis.__db.collection("profiles");
+      const rows = await col.aggregate([
+        {
+          $project: {
+            _id: 0, username: 1,
+            tournamentPoints: { $ifNull: ["$tournamentPoints", 0] },
+            bonusHuntPoints:  { $ifNull: ["$bonusHuntPoints", 0] },
+            pvpPoints:        { $ifNull: ["$pvpPoints", 0] },
+            lucky7Points:     { $ifNull: ["$lucky7Points", 0] },
+          }
+        },
+        {
+          $addFields: {
+            totalPoints: {
+              $add: ["$tournamentPoints", "$bonusHuntPoints", "$pvpPoints", "$lucky7Points"]
+            }
+          }
+        },
+        { $sort: { totalPoints: -1, tournamentPoints: -1, bonusHuntPoints: -1, pvpPoints: -1, lucky7Points: -1, username: 1 } },
+        { $limit: limit }
+      ]).toArray();
+
+      let lastKey = null, rank = 0;
+      const ranked = rows.map((r, i) => {
+        const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
+        if (key !== lastKey) { rank = i + 1; lastKey = key; }
+        return { rank, ...r };
+      });
+
+      return res.json({ items: ranked });
+    }
+
+    // memory fallback
+    const items = Object.values(memory.profiles || {})
+      .map(p => ({
+        username: p.username,
+        tournamentPoints: Number(p.tournamentPoints || 0),
+        bonusHuntPoints:  Number(p.bonusHuntPoints || 0),
+        pvpPoints:        Number(p.pvpPoints || 0),
+        lucky7Points:     Number(p.lucky7Points || 0),
+      }))
+      .map(r => ({ ...r,
+        totalPoints: r.tournamentPoints + r.bonusHuntPoints + r.pvpPoints + r.lucky7Points
+      }))
+      .sort((a, b) =>
+        (b.totalPoints || 0) - (a.totalPoints || 0) ||
+        (b.tournamentPoints || 0) - (a.tournamentPoints || 0) ||
+        (b.bonusHuntPoints || 0) - (a.bonusHuntPoints || 0) ||
+        (b.pvpPoints || 0) - (a.pvpPoints || 0) ||
+        (b.lucky7Points || 0) - (a.lucky7Points || 0) ||
+        a.username.localeCompare(b.username)
+      )
+      .slice(0, limit);
+
+    let lastKey = null, rank = 0;
+    const ranked = items.map((r, i) => {
+      const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
+      if (key !== lastKey) { rank = i + 1; lastKey = key; }
+      return { rank, ...r };
+    });
+
+    return res.json({ items: ranked });
+  } catch (e) {
+    console.error("[LEADERBOARD] overall list failed", e);
+    return res.status(500).json({ error: "failed" });
+  }
+});
 
 /* ===================== PVP (entries + toggle) ===================== */
 
@@ -1551,7 +1792,23 @@ app.listen(PORT, HOST, () => {
         console.warn("[DB] promo index setup failed:", e?.message || e);
       }
     }
+
+    // ===== leaderboard indexes =====
+    async function ensureLeaderboardIndexes(db) {
+      try {
+        const lm = db.collection("leaderboard_monthly");
+        await lm.createIndex({ month: 1, username: 1 }, { unique: true });
+        await lm.createIndex({ month: 1, totalPoints: -1 });
+        const pf = db.collection("profiles");
+        await pf.createIndex({ username: 1 }, { unique: true });
+        console.log("[DB] leaderboard indexes ensured");
+      } catch (e) {
+        console.warn("[DB] leaderboard index setup failed:", e?.message || e);
+      }
+    }
+
     await ensurePromoIndexes(globalThis.__db);
+    await ensureLeaderboardIndexes(globalThis.__db);
   } catch (err) {
     console.error("[DB] Mongo connection failed:", err?.message || err);
     if (!ALLOW_MEMORY_FALLBACK) { console.error("[DB] ALLOW_MEMORY_FALLBACK=false — exiting"); process.exit(1); }
