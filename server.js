@@ -1,14 +1,18 @@
-// server.js — full ESM build (TOTAL ROUNDS BANDS from Battleground; Bets drafts/publish)
-// + Wallet persistence (Mongo or memory) and one-time SIGNUP_BONUS
-// + Monthly leaderboard buckets that auto "reset" without touching lifetime totals
-// + NEW: Durable disk-persistence fallback when Mongo is not available (prevents balance/points loss on restart)
+// server.js — ESM
+// Lifetime + Monthly leaderboard (no reset of lifetime)
+// Wallet persistence: MongoDB if available, else safe file-persist (auto-fallback to /tmp), else memory.
+// Includes: Kick OAuth, promos, raffles, PVP, BG/Bonus live, bets drafts/publish.
 
 import fs from "fs";
+import os from "os";
 import path from "path";
 import express from "express";
 import cookieParser from "cookie-parser";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
+import helmet from "helmet";
+import compression from "compression";
+import morgan from "morgan";
 import { fileURLToPath } from "url";
 import { MongoClient, ObjectId } from "mongodb";
 import dotenv from "dotenv";
@@ -33,14 +37,19 @@ const MONGO_URI = process.env.MONGO_URI || "";
 const MONGO_DB  = process.env.MONGO_DB  || "lash3z";
 const ALLOW_MEMORY_FALLBACK = (process.env.ALLOW_MEMORY_FALLBACK || "true") === "true";
 
-// NEW: Disk persistence fallback when running without Mongo
-const ENABLE_DISK_PERSISTENCE = (process.env.STATE_PERSIST ?? "true") === "true";
-const STATE_FILE = process.env.STATE_FILE || path.join(process.cwd(), ".data", "state.json");
-
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s=>s.trim()).filter(Boolean);
 
 const SIGNUP_BONUS = Number(process.env.SIGNUP_BONUS || 0);
+
+// State-persist fallback (for when Mongo is not available)
+const STATE_PERSIST = (process.env.STATE_PERSIST ?? "true") === "true";
+const STATE_CANDIDATES = [
+  process.env.STATE_FILE && path.resolve(process.env.STATE_FILE),
+  path.join(process.cwd(), ".data", "lash3z-state.json"),
+  path.join(os.tmpdir(), "lash3z-state.json"),
+].filter(Boolean);
+let STATE_FILE = STATE_CANDIDATES[0];
 
 /* ===== Kick OAuth ENV ===== */
 const KICK_OAUTH_AUTHORIZE = "https://id.kick.com/oauth/authorize";
@@ -84,7 +93,56 @@ const ADMIN_HUB_FILE = resolveFirstExisting([
   "admin/admin_hub.html",
 ]);
 
-/* ===================== Memory (with disk persist fallback) ===================== */
+/* ===================== Persistence (file fallback) ===================== */
+let storageMode = "memory"; // "mongo" | "file" | "memory"
+function ensureWritableStatePath() {
+  for (const cand of STATE_CANDIDATES) {
+    try {
+      const dir = path.dirname(cand);
+      fs.mkdirSync(dir, { recursive: true });
+      const t = path.join(dir, ".write-test");
+      fs.writeFileSync(t, "ok");
+      fs.rmSync(t);
+      STATE_FILE = cand;
+      return true;
+    } catch {}
+  }
+  return false;
+}
+
+let saveTimer = null;
+const saveDelayMs = 500;
+function scheduleSave() {
+  if (storageMode !== "file" || !STATE_PERSIST) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      const data = JSON.stringify(memory, null, 2);
+      fs.writeFileSync(STATE_FILE, data);
+      // eslint-disable-next-line no-console
+      console.log(`[PERSIST] state saved → ${STATE_FILE}`);
+    } catch (e) {
+      console.warn("[PERSIST] save failed:", e?.message || e);
+    }
+  }, saveDelayMs);
+}
+function loadStateIfPresent() {
+  if (!STATE_PERSIST) return;
+  try {
+    if (existsSync(STATE_FILE)) {
+      const text = fs.readFileSync(STATE_FILE, "utf8");
+      const parsed = JSON.parse(text);
+      // shallow merge; keep schema defaults for new keys
+      Object.assign(memory, parsed || {});
+      // eslint-disable-next-line no-console
+      console.log(`[PERSIST] state loaded from ${STATE_FILE}`);
+    }
+  } catch (e) {
+    console.warn("[PERSIST] load failed:", e?.message || e);
+  }
+}
+
+/* ===================== Memory (default values) ===================== */
 const memory = {
   jackpot: { amount: 0, month: new Date().toISOString().slice(0,7), perSubAUD: 2.5 },
   rules: {
@@ -93,12 +151,12 @@ const memory = {
     jackpotPerSubAUD: 2.50, jackpotCurrency: "AUD", depositContributesJackpot: false
   },
   events: [],
-  wallets: {},        // persistent when Mongo or disk persist
-  users: new Map(),   // in-memory users (only if DB is unavailable)
+  wallets: {},        // wallets in fallback mode (with ledger)
+  users: new Map(),   // memory-only user store when Mongo missing
   raffles: [],
   claims: [],
   deposits: [],
-  profiles: {},       // lifetime cumulative points (disk-persist in memory mode)
+  profiles: {},
   pvpEntries: [],
   pvpBracket: null,
   live: { pvp: null, battleground: null, bonus: null },
@@ -115,87 +173,22 @@ const memory = {
   promoRedemptions: [],
 
   // Monthly leaderboard buckets (memory fallback)
-  monthlyLB: {}   // { "YYYY-MM": { USER: { ...points } } }
+  monthlyLB: {},   // { "YYYY-MM": { USER: { ...points } } }
+
+  // meta
+  __version: 1
 };
-
-// ---- Disk persistence helpers (only used when Mongo is not ready) ----
-function deepMerge(target, src) {
-  if (!src || typeof src !== "object") return target;
-  for (const k of Object.keys(src)) {
-    const v = src[k];
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      if (!target[k] || typeof target[k] !== "object" || Array.isArray(target[k])) target[k] = {};
-      deepMerge(target[k], v);
-    } else {
-      target[k] = v;
-    }
-  }
-  return target;
-}
-function ensureDir(p){ try{ fs.mkdirSync(p, { recursive: true }); }catch{} }
-const stateDir = path.dirname(STATE_FILE);
-ensureDir(stateDir);
-
-let __saveTimer = null;
-function scheduleSave() {
-  if (globalThis.__dbReady) return;               // Mongo active → don't use disk fallback
-  if (!ENABLE_DISK_PERSISTENCE) return;
-  clearTimeout(__saveTimer);
-  __saveTimer = setTimeout(() => {
-    try {
-      const tmp = STATE_FILE + ".tmp";
-      const payload = JSON.stringify({
-        wallets: memory.wallets,
-        profiles: memory.profiles,
-        monthlyLB: memory.monthlyLB,
-        promoCodes: memory.promoCodes,
-        promoRedemptions: memory.promoRedemptions,
-        pvpEntries: memory.pvpEntries,
-        raffles: memory.raffles,
-        claims: memory.claims,
-        deposits: memory.deposits,
-        live: memory.live,
-        flags: memory.flags,
-        ts: Date.now(),
-        version: 1
-      }, null, 2);
-      fs.writeFileSync(tmp, payload);
-      fs.renameSync(tmp, STATE_FILE); // atomic swap
-    } catch (e) {
-      console.warn("[PERSIST] save failed:", e?.message || e);
-    }
-  }, 250);
-}
-function loadFromDisk() {
-  if (!ENABLE_DISK_PERSISTENCE) return false;
-  try {
-    if (!existsSync(STATE_FILE)) return false;
-    const raw = fs.readFileSync(STATE_FILE, "utf8");
-    const saved = JSON.parse(raw);
-    deepMerge(memory, saved);
-    console.log(`[PERSIST] State loaded from ${STATE_FILE}`);
-    return true;
-  } catch (e) {
-    console.warn("[PERSIST] load failed:", e?.message || e);
-    return false;
-  }
-}
-loadFromDisk();
-// save on exit
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(sig, () => {
-    try { scheduleSave(); setTimeout(()=>process.exit(0), 150); } catch { process.exit(0); }
-  });
-}
 
 /* ===================== App ===================== */
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(compression());
+app.use(morgan(NODE_ENV === "production" ? "tiny" : "dev")));
 
-// security headers
+// security headers already covered mostly by helmet
 app.use((req, res, next) => {
-  res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Permissions-Policy", "interest-cohort=()");
   next();
@@ -295,7 +288,6 @@ app.get(["/api/admin/gate/check", "/api/admin/me"], verifyAdminToken, (req, res)
 
 /* ===================== Health/Home/Admin pages ===================== */
 app.get("/api/health", (req, res) => {
-  const storageMode = globalThis.__dbReady ? "mongo" : (existsSync(STATE_FILE) ? "disk" : "memory");
   res.json({
     ok: true, env: NODE_ENV, port: PORT,
     publicDir: PUBLIC_DIR, homeIndex: HOME_INDEX, hasHome: HAS_HOME,
@@ -303,6 +295,7 @@ app.get("/api/health", (req, res) => {
     adminHubFile: ADMIN_HUB_FILE, hasAdminHub: !!ADMIN_HUB_FILE,
     db: !!globalThis.__dbReady,
     storageMode,
+    stateFile: storageMode === "file" ? STATE_FILE : null,
     adminBypass: DISABLE_ADMIN_AUTH,
     kick: {
       configured: !!(KICK_CLIENT_ID && KICK_CLIENT_SECRET && KICK_REDIRECT_URI),
@@ -363,7 +356,7 @@ app.use(express.static(PUBLIC_DIR, {
 }));
 
 /* ======================================================================== */
-/* ===================== WALLET / USER HELPERS (NEW) ====================== */
+/* ===================== WALLET / USER HELPERS ============================ */
 /* ======================================================================== */
 
 const U = (s) => String(s || "").trim().toUpperCase();
@@ -373,7 +366,7 @@ const hash = (pwd) => crypto.createHash("sha256").update(String(pwd)).digest("he
 // Leaderboard helpers
 const currentMonth = () => new Date().toISOString().slice(0, 7); // "YYYY-MM"
 
-// ===== PROMO HELPERS (added) =====
+// ===== PROMO HELPERS =====
 function normCode(s = "") {
   return String(s).trim().toUpperCase().replace(/\s+/g, "");
 }
@@ -420,10 +413,9 @@ async function getWallet(username) {
     return { username: user, balance: 0, signupBonusGrantedAt: null };
   }
 
-  // memory (disk persisted)
+  // file/memory
   const w = memory.wallets[user] || { balance: 0, signupBonusGrantedAt: null, ledger: [] };
   memory.wallets[user] = w;
-  scheduleSave();
   return { username: user, balance: Number(w.balance || 0), signupBonusGrantedAt: w.signupBonusGrantedAt };
 }
 
@@ -448,7 +440,7 @@ async function adjustWallet(username, delta, reason = "adjust") {
     return { ok: true, balance: Number(r.value?.balance || 0) };
   }
 
-  // memory (disk persisted)
+  // file/memory
   const w = memory.wallets[user] || { balance: 0, ledger: [], signupBonusGrantedAt: null };
   w.balance = Number(w.balance || 0) + amount;
   w.ledger.push({ ts: nowISO(), delta: amount, reason });
@@ -483,7 +475,7 @@ async function grantSignupBonusIfNeeded(username) {
     return { ok: true, balance: Number(r.value?.balance || 0) };
   }
 
-  // memory (disk persisted)
+  // file/memory
   const w = memory.wallets[user] || { balance: 0, ledger: [], signupBonusGrantedAt: null };
   if (w.signupBonusGrantedAt) return { ok: true, skipped: true, balance: Number(w.balance || 0) };
   w.balance = Number(w.balance || 0) + bonus;
@@ -515,7 +507,7 @@ async function userCreate(username, passHash) {
   return doc;
 }
 
-/* ===================== Minimal APIs you had ===================== */
+/* ===================== Wallet + Viewer APIs ===================== */
 function walletAdjustHandler(req, res){
   const u = String(req.body?.username || req.body?.user || req.body?.name || "").toUpperCase();
   const delta = Number(req.body?.delta || req.body?.amount || 0);
@@ -544,7 +536,7 @@ app.get("/api/wallet/balance", verifyAdminToken, async (req, res) => {
   res.json({ balance: Number(w.balance || 0) });
 });
 
-// ✅ public wallet read; now uses persistent wallet and viewer cookie
+// ✅ public wallet read
 app.get("/api/wallet/me", async (req, res) => {
   const cookieName = String(req.cookies?.viewer || "").toUpperCase();
   const qName      = String(req.query.viewer || "").toUpperCase();
@@ -554,7 +546,6 @@ app.get("/api/wallet/me", async (req, res) => {
 });
 
 /* ===================== Viewer session (unified login) ===================== */
-// Register
 app.post("/api/viewer/register", async (req, res) => {
   try {
     const name = U(req.body?.username || req.body?.user || "");
@@ -639,13 +630,43 @@ app.post("/api/viewer/logout", (req, res) => {
 });
 
 /* ===================== Kick OAuth Linking ===================== */
-// Small PKCE store (swap to Redis if you scale horizontally)
-const pkceStore = new Map(); // state -> { verifier, ts, viewer }
+/** We persist PKCE verifier + state in a secure, httpOnly cookie to avoid
+ *  'invalid_state' if the process restarts or a different instance handles
+ *  the callback. */
+const PKCE_COOKIE = "kick_pkce";
 
-// helpers
 function b64url(buf) {
   return buf.toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
 }
+function sign(data) {
+  const h = crypto.createHmac("sha256", JWT_SECRET).update(data).digest("hex");
+  return h.slice(0, 16); // short tag
+}
+function setPkceCookie(res, payload) {
+  const raw = JSON.stringify(payload);
+  const tag = sign(raw);
+  res.cookie(PKCE_COOKIE, `${tag}.${b64url(Buffer.from(raw))}`, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: NODE_ENV === "production",
+    maxAge: 5 * 60 * 1000, // 5 minutes
+    path: "/",
+  });
+}
+function readPkceCookie(req) {
+  const v = req.cookies?.[PKCE_COOKIE];
+  if (!v) return null;
+  const [tag, dataB64] = String(v).split(".");
+  try {
+    const raw = Buffer.from(dataB64, "base64").toString("utf8");
+    if (sign(raw) !== tag) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object") return null;
+    return obj;
+  } catch { return null; }
+}
+
+/** Save Kick link for a viewer */
 async function saveKickLink(username, profile /*, tokens */) {
   const u = U(username);
   if (!u) return;
@@ -659,7 +680,6 @@ async function saveKickLink(username, profile /*, tokens */) {
             id: profile.id,
             username: profile.username,
             linkedAt: new Date()
-            // If you want tokens later: accessToken: tokens.access_token, refreshToken: tokens.refresh_token
           }
         }
       },
@@ -705,7 +725,8 @@ app.get("/auth/kick", requireViewer, (req, res) => {
   const verifier = b64url(crypto.randomBytes(32));
   const challenge = b64url(crypto.createHash("sha256").update(verifier).digest());
 
-  pkceStore.set(state, { verifier, ts: Date.now(), viewer: req.viewer });
+  // Persist to cookie (viewer + verifier + state + ts)
+  setPkceCookie(res, { viewer: req.viewer, verifier, state, ts: Date.now() });
 
   const url = new URL(KICK_OAUTH_AUTHORIZE);
   url.searchParams.set("response_type", "code");
@@ -725,17 +746,20 @@ app.get("/auth/kick/callback", async (req, res) => {
     const { code, state, error, error_description } = req.query;
     if (error) return res.redirect(`/profile?kickError=${encodeURIComponent(error_description || error)}`);
 
-    const rec = pkceStore.get(state);
-    pkceStore.delete(state);
-    if (!rec) return res.redirect(`/profile?kickError=invalid_state`);
+    const stored = readPkceCookie(req);
+    res.clearCookie(PKCE_COOKIE, { path: "/" });
 
-    // Exchange code → tokens
+    if (!stored || !stored.state || stored.state !== state) {
+      return res.redirect(`/profile?kickError=invalid_state`);
+    }
+    if (!code) return res.redirect(`/profile?kickError=missing_code`);
+
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       client_id: KICK_CLIENT_ID,
       client_secret: KICK_CLIENT_SECRET,
       redirect_uri: KICK_REDIRECT_URI,
-      code_verifier: rec.verifier,
+      code_verifier: stored.verifier,
       code
     });
 
@@ -749,7 +773,6 @@ app.get("/auth/kick/callback", async (req, res) => {
       return res.redirect(`/profile?kickError=token_exchange_failed`);
     }
 
-    // Fetch current user profile from Kick
     const meRes = await fetch(`${KICK_API_BASE}/users/me`, {
       headers: { Authorization: `Bearer ${tokens.access_token}` }
     });
@@ -758,8 +781,7 @@ app.get("/auth/kick/callback", async (req, res) => {
       return res.redirect(`/profile?kickError=user_fetch_failed`);
     }
 
-    // Persist link against the original viewer who started the flow
-    await saveKickLink(rec.viewer, profile /*, tokens*/);
+    await saveKickLink(stored.viewer, profile /*, tokens*/);
 
     res.redirect(`/profile?kickLinked=1`);
   } catch (e) {
@@ -782,8 +804,18 @@ app.post("/api/kick/unlink", requireViewer, async (req, res) => {
 
 /* ===================== Deposits / Orders ===================== */
 app.get("/api/deposits/pending", verifyAdminToken, (req, res) => res.json({ orders: memory.deposits }));
-app.post("/api/deposits/:id/approve", verifyAdminToken, (req, res) => { const id = String(req.params.id); memory.deposits = memory.deposits.filter(o => String(o.id||o._id) !== id); scheduleSave(); res.json({ success: true }); });
-app.post("/api/deposits/:id/reject", verifyAdminToken, (req, res) => { const id = String(req.params.id); memory.deposits = memory.deposits.filter(o => String(o.id||o._id) !== id); scheduleSave(); res.json({ success: true }); });
+app.post("/api/deposits/:id/approve", verifyAdminToken, (req, res) => {
+  const id = String(req.params.id);
+  memory.deposits = memory.deposits.filter(o => String(o.id||o._id) !== id);
+  scheduleSave();
+  res.json({ success: true });
+});
+app.post("/api/deposits/:id/reject", verifyAdminToken, (req, res) => {
+  const id = String(req.params.id);
+  memory.deposits = memory.deposits.filter(o => String(o.id||o._id) !== id);
+  scheduleSave();
+  res.json({ success: true });
+});
 
 // accept client submit
 app.post("/api/lbx/orders", (req, res) => {
@@ -795,7 +827,6 @@ app.post("/api/lbx/orders", (req, res) => {
   scheduleSave();
   res.json({ success: true, order: o });
 });
-
 /* ===================== Raffles / Giveaways (admin shims) ===================== */
 function ensureRaffle(rid){
   let r = (memory.raffles||[]).find(x => x.rid === rid);
@@ -866,7 +897,6 @@ app.post("/api/leaderboard/upsert", verifyAdminToken, async (req, res) => {
   const user = String(req.body?.user || req.body?.username || "").toUpperCase();
   if (!user) return res.status(400).json({ error: "username required" });
 
-  // Which category? default tournament
   const mode = String(req.body?.mode || "tournament").toLowerCase();
   const fieldMap = {
     tournament: "tournamentPoints",
@@ -876,7 +906,6 @@ app.post("/api/leaderboard/upsert", verifyAdminToken, async (req, res) => {
   };
   const field = fieldMap[mode] || "tournamentPoints";
 
-  // Delta (keep backward compat with deltaTournamentPoints)
   const delta = Number(
     req.body?.delta ??
     req.body?.deltaTournamentPoints ??
@@ -950,7 +979,7 @@ app.post("/api/leaderboard/upsert", verifyAdminToken, async (req, res) => {
         }
       });
     } else {
-      // ===== Memory fallback (disk persisted) =====
+      // ===== File/Memory fallback =====
       // cumulative
       const p = memory.profiles[user] || {
         username: user,
@@ -1030,7 +1059,7 @@ app.get("/api/leaderboard/monthly", async (req, res) => {
       return res.json({ month, items: ranked });
     }
 
-    // memory fallback
+    // file/memory fallback
     const bucket = memory.monthlyLB[month] || {};
     const items = Object.values(bucket)
       .sort((a, b) =>
@@ -1095,7 +1124,7 @@ app.get("/api/leaderboard/overall", async (req, res) => {
       return res.json({ items: ranked });
     }
 
-    // memory fallback
+    // file/memory fallback
     const items = Object.values(memory.profiles || {})
       .map(p => ({
         username: p.username,
@@ -1152,7 +1181,6 @@ app.post("/api/pvp/entries", async (req, res) => {
   const game     = String(req.body?.game || "").trim();
   if (!username) return res.status(400).json({ error: "username required" });
 
-  // respect admin toggle
   if (!memory.flags.pvpEntriesOpen) return res.status(403).json({ error: "entries_closed" });
 
   const doc = { username, side: side==="WEST" ? "WEST" : "EAST", game, status: "pending", ts: new Date() };
@@ -1165,7 +1193,7 @@ app.post("/api/pvp/entries", async (req, res) => {
       const saved = await col.findOne({ _id: r.insertedId });
       return res.json({ success: true, entry: saved });
     } else {
-      const exists = memory.pvpEntries.find(e => e.username === username);
+      const exists = (memory.pvpEntries||[]).find(e => e.username === username);
       if (exists) return res.status(409).json({ error: "duplicate", entry: exists });
       const saved = { _id: String(Date.now()), ...doc };
       memory.pvpEntries.push(saved);
@@ -1183,7 +1211,7 @@ app.get("/api/pvp/entries", verifyAdminToken, async (req, res) => {
       const list = await globalThis.__db.collection("pvp_entries").find().sort({ ts: -1 }).toArray();
       return res.json({ entries: list });
     } else {
-      const list = [...memory.pvpEntries].sort((a,b)=> new Date(b.ts) - new Date(a.ts));
+      const list = [...(memory.pvpEntries||[])].sort((a,b)=> new Date(b.ts) - new Date(a.ts));
       return res.json({ entries: list });
     }
   } catch (e) {
@@ -1203,7 +1231,7 @@ app.post("/api/pvp/entries/:id/status", verifyAdminToken, async (req, res) => {
       return res.json({ success: r.matchedCount > 0 });
     } else {
       const id = req.params.id;
-      const i = memory.pvpEntries.findIndex(e => e._id === id || e.username === id.toUpperCase());
+      const i = (memory.pvpEntries||[]).findIndex(e => e._id === id || e.username === id.toUpperCase());
       if (i < 0) return res.json({ success: false });
       memory.pvpEntries[i].status = status;
       scheduleSave();
@@ -1224,10 +1252,10 @@ app.delete("/api/pvp/entries/:id", verifyAdminToken, async (req, res) => {
       return res.json({ success: r.deletedCount > 0 });
     } else {
       const id = req.params.id;
-      const before = memory.pvpEntries.length;
-      memory.pvpEntries = memory.pvpEntries.filter(e => e._id !== id && e.username !== id.toUpperCase());
+      const before = (memory.pvpEntries||[]).length;
+      memory.pvpEntries = (memory.pvpEntries||[]).filter(e => e._id !== id && e.username !== id.toUpperCase());
       scheduleSave();
-      return res.json({ success: memory.pvpEntries.length !== before });
+      return res.json({ success: (memory.pvpEntries||[]).length !== before });
     }
   } catch (e) {
     console.error("[PVP] delete failed", e);
@@ -1235,7 +1263,7 @@ app.delete("/api/pvp/entries/:id", verifyAdminToken, async (req, res) => {
   }
 });
 
-/* ===================== PVP Bracket + LIVE BG/Bonus (kept) ===================== */
+/* ===================== PVP Bracket + LIVE BG/Bonus ===================== */
 function nowMs(){ return Date.now(); }
 function emptyRound(n){
   return Array.from({length:n}, (_,i)=>({
@@ -1456,13 +1484,12 @@ app.post("/api/battleground/builder", verifyAdminToken, async (req,res)=>{
   }catch(e){ console.error("[BG] publish failed", e); res.status(500).json({ error:"failed" }); }
 });
 
-// Alias: /api/battleground/publish  → same as /api/battleground/builder
+// Alias
 app.post("/api/battleground/publish", verifyAdminToken, async (req, res) => {
   try {
     const raw = (req.body && typeof req.body === "object") ? req.body : null;
     const b   = raw?.builder ?? raw;
     if (!b || !Array.isArray(b.matches)) return res.status(400).json({ error: "invalid builder" });
-
     await saveLiveBuilder("battleground", b);
 
     const m = Array.isArray(b.matches) ? b.matches.length : 0;
@@ -1481,7 +1508,7 @@ app.post("/api/battleground/publish", verifyAdminToken, async (req, res) => {
 app.get("/api/bonus-hunt/live", async (req,res)=>{ try{ const b = await getLiveBuilder("bonus"); res.json({ builder: b || null }); }catch(e){ console.error("[BH] live get failed", e); res.status(500).json({ error:"failed" }); }});
 app.post("/api/bonus-hunt/builder", verifyAdminToken, async (req,res)=>{ try{ const raw = (req.body && typeof req.body==='object') ? req.body : null; const b = raw?.builder ?? raw; if (!b || !Array.isArray(b.games)) return res.status(400).json({ error:"invalid builder" }); await saveLiveBuilder("bonus", b); res.json({ success:true }); }catch(e){ console.error("[BH] publish failed", e); res.status(500).json({ error:"failed" }); }});
 
-// Alias: /api/bonus-hunt/publish  → same as /api/bonus-hunt/builder
+// Alias
 app.post("/api/bonus-hunt/publish", verifyAdminToken, async (req, res) => {
   try {
     const raw = (req.body && typeof req.body === "object") ? req.body : null;
@@ -1595,39 +1622,6 @@ app.post("/api/admin/bets/publish", verifyAdminToken, (req,res)=>{
   }
 });
 
-// Shim: POST /api/bets/publish  (mirrors /api/admin/bets/publish)
-app.post("/api/bets/publish", verifyAdminToken, (req, res) => {
-  const { id, all = false, kind = "" } = req.body || {};
-  if (all) {
-    const k = String(kind || "").toLowerCase();
-    const moving = k
-      ? memory.betsDrafts.filter(x => String(x.kind || "").toLowerCase() === k)
-      : [...memory.betsDrafts];
-
-    moving.forEach(evt => {
-      memory.betsPublished = [
-        evt,
-        ...memory.betsPublished.filter(x => (x.eventId || x.id) !== (evt.eventId || evt.id))
-      ];
-    });
-
-    memory.betsDrafts = memory.betsDrafts.filter(x => !moving.includes(x));
-    scheduleSave();
-    return res.json({ ok: true, published: moving.length });
-  } else {
-    const i = memory.betsDrafts.findIndex(x => (x.eventId || x.id) === id);
-    if (i < 0) return res.status(404).json({ ok: false, error: "not found" });
-    const evt = memory.betsDrafts[i];
-    memory.betsDrafts.splice(i, 1);
-    memory.betsPublished = [
-      evt,
-      ...memory.betsPublished.filter(x => (x.eventId || x.id) !== (evt.eventId || evt.id))
-    ];
-    scheduleSave();
-    return res.json({ ok: true, id: (evt.eventId || evt.id) });
-  }
-});
-
 // Public read for “live bets”
 app.get("/api/bets/live", (req,res)=>{
   const kind = String(req.query.kind || "").toLowerCase();
@@ -1636,7 +1630,7 @@ app.get("/api/bets/live", (req,res)=>{
   res.json({ ok:true, items, ts: Date.now() });
 });
 
-// Shim: GET /api/bets/published  (same shape as /api/bets/live)
+// Shim: GET /api/bets/published
 app.get("/api/bets/published", (req, res) => {
   const kind = String(req.query.kind || "").toLowerCase();
   let items = [...memory.betsPublished];
@@ -1645,7 +1639,6 @@ app.get("/api/bets/published", (req, res) => {
 });
 
 /* ===================== LBX PROMO CODES — ADMIN ===================== */
-// Create one
 app.post("/api/admin/promo/create", verifyAdminToken, async (req, res) => {
   try {
     let { code, amount, maxRedemptions=1, perUserLimit=1, expiresAt=null, notes="" } = req.body || {};
@@ -1674,7 +1667,7 @@ app.post("/api/admin/promo/create", verifyAdminToken, async (req, res) => {
     if (globalThis.__dbReady) {
       await globalThis.__db.collection("promo_codes").insertOne(doc);
     } else {
-      if (memory.promoCodes.some(p => p.code === doc.code)) return res.status(409).json({ ok:false, error:"CODE_EXISTS" });
+      if ((memory.promoCodes||[]).some(p => p.code === doc.code)) return res.status(409).json({ ok:false, error:"CODE_EXISTS" });
       memory.promoCodes.unshift(doc);
       scheduleSave();
     }
@@ -1686,7 +1679,6 @@ app.post("/api/admin/promo/create", verifyAdminToken, async (req, res) => {
   }
 });
 
-// Batch generate
 app.post("/api/admin/promo/generate", verifyAdminToken, async (req, res) => {
   try {
     let { prefix = "L3Z", amount, count, maxRedemptions=1, perUserLimit=1, expiresAt=null, notes="" } = req.body || {};
@@ -1718,7 +1710,7 @@ app.post("/api/admin/promo/generate", verifyAdminToken, async (req, res) => {
     } else {
       const docs = [];
       for (let i=0;i<count;i++){
-        let c; do { c = mkCode(); } while (memory.promoCodes.some(p => p.code === c));
+        let c; do { c = mkCode(); } while ((memory.promoCodes||[]).some(p => p.code === c));
         docs.push({
           code: c, amount,
           maxRedemptions: Number(maxRedemptions),
@@ -1732,7 +1724,7 @@ app.post("/api/admin/promo/generate", verifyAdminToken, async (req, res) => {
           updatedAt: now,
         });
       }
-      memory.promoCodes.unshift(...docs);
+      memory.promoCodes = [...docs, ...(memory.promoCodes||[])];
       scheduleSave();
       return res.json({ ok:true, generated: docs.length, sample: docs.slice(0,5).map(d=>d.code) });
     }
@@ -1750,7 +1742,7 @@ app.get("/api/admin/promo/list", verifyAdminToken, async (req, res) => {
     const items = await globalThis.__db.collection("promo_codes").find(q).sort({ createdAt: -1 }).limit(500).toArray();
     return res.json({ ok:true, items });
   } else {
-    let items = [...memory.promoCodes];
+    let items = [...(memory.promoCodes||[])];
     if (only !== null) items = items.filter(p => !!p.active === only);
     return res.json({ ok:true, items });
   }
@@ -1762,7 +1754,7 @@ app.post("/api/admin/promo/disable", verifyAdminToken, async (req, res) => {
     const r = await globalThis.__db.collection("promo_codes").updateOne({ code }, { $set: { active:false, updatedAt: new Date() } });
     return res.json({ ok:true, modified: r.modifiedCount });
   } else {
-    const i = memory.promoCodes.findIndex(p => p.code === code);
+    const i = (memory.promoCodes||[]).findIndex(p => p.code === code);
     if (i >= 0) memory.promoCodes[i].active = false;
     scheduleSave();
     return res.json({ ok:true, modified: i >= 0 ? 1 : 0 });
@@ -1815,14 +1807,14 @@ app.post("/api/promo/redeem", requireViewer, tinyRateLimit(), async (req, res) =
       return res.json({ ok:true, added: Number(promo.amount||0), code, balance: credited.balance });
     }
 
-    // ===== MEMORY MODE (disk persisted) =====
-    const promo = memory.promoCodes.find(p => p.code === code);
+    // ===== FILE/MEMORY MODE =====
+    const promo = (memory.promoCodes||[]).find(p => p.code === code);
     if (!promo || !promo.active) return res.status(404).json({ ok:false, error:"INVALID_CODE" });
     if (promo.expiresAt && promo.expiresAt < now) return res.status(410).json({ ok:false, error:"EXPIRED" });
 
     if (promo.redeemedCount >= promo.maxRedemptions) return res.status(409).json({ ok:false, error:"DEPLETED" });
 
-    const userClaims = memory.promoRedemptions.filter(r => r.code === code && r.username === username).length;
+    const userClaims = (memory.promoRedemptions||[]).filter(r => r.code === code && r.username === username).length;
     if (userClaims >= (promo.perUserLimit || 1)) return res.status(409).json({ ok:false, error:"PER_USER_LIMIT" });
 
     // reserve
@@ -1831,9 +1823,8 @@ app.post("/api/promo/redeem", requireViewer, tinyRateLimit(), async (req, res) =
 
     const credited = await adjustWallet(username, Number(promo.amount||0), `promo:${code}`);
     if (!credited?.ok) {
-      // rollback
       promo.redeemedCount = Math.max(0, promo.redeemedCount - 1);
-      memory.promoRedemptions = memory.promoRedemptions.filter(r => !(r.code === code && r.username === username));
+      memory.promoRedemptions = (memory.promoRedemptions||[]).filter(r => !(r.code === code && r.username === username));
       scheduleSave();
       return res.status(500).json({ ok:false, error:"CREDIT_FAILED" });
     }
@@ -1852,7 +1843,7 @@ app.get("/api/promo/my-redemptions", requireViewer, async (req, res) => {
       .find({ username }).sort({ createdAt: -1 }).limit(200).toArray();
     return res.json({ ok:true, items: rows });
   } else {
-    const rows = memory.promoRedemptions.filter(r => r.username === username);
+    const rows = (memory.promoRedemptions||[]).filter(r => r.username === username);
     return res.json({ ok:true, items: rows });
   }
 });
@@ -1875,16 +1866,27 @@ app.listen(PORT, HOST, () => {
 });
 
 (async () => {
+  // Decide storage mode and prep file persistence early
+  const fileOk = ensureWritableStatePath();
   if (!MONGO_URI) {
     if (!ALLOW_MEMORY_FALLBACK) console.warn("[DB] No MONGO_URI; memory mode disabled.");
-    else console.warn("[DB] No MONGO_URI; running in MEMORY MODE with DISK PERSIST.");
+    else console.warn("[DB] No MONGO_URI; using FILE PERSIST (if available) or MEMORY.");
+    if (STATE_PERSIST && fileOk) {
+      storageMode = "file";
+      loadStateIfPresent();
+      scheduleSave();
+    } else {
+      storageMode = "memory";
+    }
     return;
   }
+
   try {
     const client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
     await client.connect();
     globalThis.__db = client.db(MONGO_DB);
     globalThis.__dbReady = true;
+    storageMode = "mongo";
     console.log(`[DB] Connected to MongoDB: ${MONGO_DB}`);
 
     // ===== promo indexes =====
@@ -1921,6 +1923,14 @@ app.listen(PORT, HOST, () => {
   } catch (err) {
     console.error("[DB] Mongo connection failed:", err?.message || err);
     if (!ALLOW_MEMORY_FALLBACK) { console.error("[DB] ALLOW_MEMORY_FALLBACK=false — exiting"); process.exit(1); }
-    console.warn("[DB] Continuing in memory mode with DISK PERSIST.");
+    console.warn("[DB] Continuing without Mongo.");
+
+    if (STATE_PERSIST && ensureWritableStatePath()) {
+      storageMode = "file";
+      loadStateIfPresent();
+      scheduleSave();
+    } else {
+      storageMode = "memory";
+    }
   }
 })();
