@@ -185,7 +185,7 @@ app.disable("x-powered-by");
 app.set("trust proxy", 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(compression());
-app.use(morgan(NODE_ENV === "production" ? "tiny" : "dev")));
+app.use(morgan(NODE_ENV === "production" ? "tiny" : "dev"));
 
 // security headers already covered mostly by helmet
 app.use((req, res, next) => {
@@ -1934,3 +1934,4 @@ app.listen(PORT, HOST, () => {
     }
   }
 })();
+
