@@ -144,7 +144,7 @@ function loadStateIfPresent() {
 
 /* ===================== Memory (default values) ===================== */
 const memory = {
-  jackpot: { amount: 0, month: new Date().toISOString().slice(0,7), perSubAUD: 2.5 },
+  jackpot: { amount: 0, month: new Date().toISOString().slice(0,7), perSubAUD: 2.5, currency: "AUD" },
   rules: {
     lbx: { SUB_NEW: 10, SUB_RENEW: 5, SUB_GIFT_GIFTER_PER: 2, SUB_GIFT_RECIPIENT: 3 },
     caps: { eventLBXPerUserPerDay: 100 },
@@ -187,8 +187,21 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(compression());
 app.use(morgan(NODE_ENV === "production" ? "tiny" : "dev"));
 
-// security headers already covered mostly by helmet
+// security headers & CSP
 app.use((req, res, next) => {
+  // Quick unblock for inline scripts/styles — replace with nonces later if needed
+  res.setHeader(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      "img-src 'self' data: blob:",
+      "style-src 'self' 'unsafe-inline'",
+      "script-src 'self' 'unsafe-inline'",
+      "connect-src 'self' https:",
+      "frame-ancestors 'none'",
+      "base-uri 'self'"
+    ].join("; ")
+  );
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Permissions-Policy", "interest-cohort=()");
   next();
@@ -354,7 +367,6 @@ app.use(express.static(PUBLIC_DIR, {
     }
   }
 }));
-
 /* ======================================================================== */
 /* ===================== WALLET / USER HELPERS ============================ */
 /* ======================================================================== */
@@ -802,6 +814,39 @@ app.post("/api/kick/unlink", requireViewer, async (req, res) => {
   res.json({ ok: true });
 });
 
+/* ===================== JACKPOT API (NEW) ===================== */
+// Public: read current jackpot
+app.get("/api/jackpot", (req, res) => {
+  const j = memory.jackpot || { amount: 0, month: currentMonth(), perSubAUD: 2.5, currency: "AUD" };
+  res.json({
+    ok: true,
+    amount: Number(j.amount || 0),
+    month: String(j.month || currentMonth()),
+    perSubAUD: Number(j.perSubAUD || 2.5),
+    currency: String(j.currency || "AUD"),
+    ts: Date.now()
+  });
+});
+
+// Admin: set jackpot fields
+app.post("/api/admin/jackpot", verifyAdminToken, (req, res) => {
+  const b = req.body || {};
+  if (typeof b.amount === "number") memory.jackpot.amount = Number(b.amount);
+  if (typeof b.perSubAUD === "number") memory.jackpot.perSubAUD = Number(b.perSubAUD);
+  if (typeof b.currency === "string") memory.jackpot.currency = String(b.currency || "AUD");
+  if (typeof b.month === "string") memory.jackpot.month = String(b.month);
+  scheduleSave();
+  res.json({ ok: true, jackpot: memory.jackpot });
+});
+
+// Admin: increment/decrement by delta
+app.patch("/api/admin/jackpot/increment", verifyAdminToken, (req, res) => {
+  const delta = Number(req.body?.delta || 0);
+  memory.jackpot.amount = Number(memory.jackpot.amount || 0) + delta;
+  scheduleSave();
+  res.json({ ok: true, amount: memory.jackpot.amount });
+});
+
 /* ===================== Deposits / Orders ===================== */
 app.get("/api/deposits/pending", verifyAdminToken, (req, res) => res.json({ orders: memory.deposits }));
 app.post("/api/deposits/:id/approve", verifyAdminToken, (req, res) => {
@@ -891,275 +936,6 @@ app.post("/api/prize-claims/:id/status", verifyAdminToken, (req, res) => {
   scheduleSave();
   res.json({ success: true });
 });
-
-/* ===================== Leaderboard (monthly + lifetime) ===================== */
-app.post("/api/leaderboard/upsert", verifyAdminToken, async (req, res) => {
-  const user = String(req.body?.user || req.body?.username || "").toUpperCase();
-  if (!user) return res.status(400).json({ error: "username required" });
-
-  const mode = String(req.body?.mode || "tournament").toLowerCase();
-  const fieldMap = {
-    tournament: "tournamentPoints",
-    bonus:      "bonusHuntPoints",
-    pvp:        "pvpPoints",
-    lucky7:     "lucky7Points",
-  };
-  const field = fieldMap[mode] || "tournamentPoints";
-
-  const delta = Number(
-    req.body?.delta ??
-    req.body?.deltaTournamentPoints ??
-    0
-  );
-  const actions = Array.isArray(req.body?.actions) ? req.body.actions : [];
-  const month = String(req.body?.month || currentMonth());
-
-  try {
-    if (globalThis.__dbReady) {
-      const db = globalThis.__db;
-
-      // 1) Cumulative lifetime in profiles
-      const profiles = db.collection("profiles");
-      const cumInc = { [field]: delta };
-      const r1 = await profiles.findOneAndUpdate(
-        { username: user },
-        {
-          $setOnInsert: {
-            username: user,
-            tournamentPoints: 0,
-            bonusHuntPoints:  0,
-            pvpPoints:        0,
-            lucky7Points:     0,
-            history: []
-          },
-          $inc: cumInc,
-          $push: { history: { ts: new Date(), mode, added: delta, actions } }
-        },
-        { upsert: true, returnDocument: "after" }
-      );
-
-      // 2) Monthly bucket in leaderboard_monthly
-      const monthly = db.collection("leaderboard_monthly");
-      const r2 = await monthly.findOneAndUpdate(
-        { username: user, month },
-        {
-          $setOnInsert: {
-            username: user,
-            month,
-            tournamentPoints: 0,
-            bonusHuntPoints:  0,
-            pvpPoints:        0,
-            lucky7Points:     0,
-            totalPoints:      0,
-            history: []
-          },
-          $inc: { [field]: delta, totalPoints: delta },
-          $push: { history: { ts: new Date(), mode, added: delta, actions } }
-        },
-        { upsert: true, returnDocument: "after" }
-      );
-
-      return res.json({
-        success: true,
-        cumulative: {
-          username: r1.value.username,
-          tournamentPoints: Number(r1.value.tournamentPoints || 0),
-          bonusHuntPoints:  Number(r1.value.bonusHuntPoints  || 0),
-          pvpPoints:        Number(r1.value.pvpPoints        || 0),
-          lucky7Points:     Number(r1.value.lucky7Points     || 0)
-        },
-        monthly: {
-          username: r2.value.username,
-          month: r2.value.month,
-          tournamentPoints: Number(r2.value.tournamentPoints || 0),
-          bonusHuntPoints:  Number(r2.value.bonusHuntPoints  || 0),
-          pvpPoints:        Number(r2.value.pvpPoints        || 0),
-          lucky7Points:     Number(r2.value.lucky7Points     || 0),
-          totalPoints:      Number(r2.value.totalPoints      || 0)
-        }
-      });
-    } else {
-      // ===== File/Memory fallback =====
-      // cumulative
-      const p = memory.profiles[user] || {
-        username: user,
-        tournamentPoints: 0,
-        bonusHuntPoints:  0,
-        pvpPoints:        0,
-        lucky7Points:     0,
-        history: []
-      };
-      p[field] = Number(p[field] || 0) + delta;
-      p.history.unshift({ ts: Date.now(), mode, added: delta, actions });
-      memory.profiles[user] = p;
-
-      // monthly
-      memory.monthlyLB[month] = memory.monthlyLB[month] || {};
-      const mrec = memory.monthlyLB[month][user] || {
-        username: user,
-        month,
-        tournamentPoints: 0,
-        bonusHuntPoints:  0,
-        pvpPoints:        0,
-        lucky7Points:     0,
-        totalPoints:      0,
-        history: []
-      };
-      mrec[field] = Number(mrec[field] || 0) + delta;
-      mrec.totalPoints = Number(mrec.totalPoints || 0) + delta;
-      mrec.history.unshift({ ts: Date.now(), mode, added: delta, actions });
-      memory.monthlyLB[month][user] = mrec;
-
-      scheduleSave();
-      return res.json({
-        success: true,
-        cumulative: {
-          username: p.username,
-          tournamentPoints: p.tournamentPoints,
-          bonusHuntPoints:  p.bonusHuntPoints,
-          pvpPoints:        p.pvpPoints,
-          lucky7Points:     p.lucky7Points
-        },
-        monthly: mrec
-      });
-    }
-  } catch (e) {
-    console.error("[LEADERBOARD] upsert failed", e);
-    return res.status(500).json({ error: "failed" });
-  }
-});
-app.post("/api/admin/leaderboard/rebuild", verifyAdminToken, (req,res)=> res.json({ success:true }));
-
-// Read: monthly leaderboard (auto "resets" by month bucket)
-app.get("/api/leaderboard/monthly", async (req, res) => {
-  const month = String(req.query.month || currentMonth());
-  const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 200)));
-
-  try {
-    if (globalThis.__dbReady) {
-      const col = globalThis.__db.collection("leaderboard_monthly");
-      const rows = await col.find({ month })
-        .project({
-          _id: 0, username: 1, month: 1,
-          tournamentPoints: 1, bonusHuntPoints: 1, pvpPoints: 1, lucky7Points: 1,
-          totalPoints: 1
-        })
-        .sort({ totalPoints: -1, tournamentPoints: -1, bonusHuntPoints: -1, pvpPoints: -1, lucky7Points: -1, username: 1 })
-        .limit(limit)
-        .toArray();
-
-      // dense rank
-      let lastKey = null, rank = 0;
-      const ranked = rows.map((r, i) => {
-        const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
-        if (key !== lastKey) { rank = i + 1; lastKey = key; }
-        return { rank, ...r };
-      });
-
-      return res.json({ month, items: ranked });
-    }
-
-    // file/memory fallback
-    const bucket = memory.monthlyLB[month] || {};
-    const items = Object.values(bucket)
-      .sort((a, b) =>
-        (b.totalPoints || 0) - (a.totalPoints || 0) ||
-        (b.tournamentPoints || 0) - (a.tournamentPoints || 0) ||
-        (b.bonusHuntPoints || 0) - (a.bonusHuntPoints || 0) ||
-        (b.pvpPoints || 0) - (a.pvpPoints || 0) ||
-        (b.lucky7Points || 0) - (a.lucky7Points || 0) ||
-        a.username.localeCompare(b.username)
-      )
-      .slice(0, limit);
-
-    let lastKey = null, rank = 0;
-    const ranked = items.map((r, i) => {
-      const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
-      if (key !== lastKey) { rank = i + 1; lastKey = key; }
-      return { rank, ...r };
-    });
-
-    return res.json({ month, items: ranked });
-  } catch (e) {
-    console.error("[LEADERBOARD] monthly list failed", e);
-    return res.status(500).json({ error: "failed" });
-  }
-});
-
-// Read: lifetime (overall) leaderboard
-app.get("/api/leaderboard/overall", async (req, res) => {
-  const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 200)));
-
-  try {
-    if (globalThis.__dbReady) {
-      const col = globalThis.__db.collection("profiles");
-      const rows = await col.aggregate([
-        {
-          $project: {
-            _id: 0, username: 1,
-            tournamentPoints: { $ifNull: ["$tournamentPoints", 0] },
-            bonusHuntPoints:  { $ifNull: ["$bonusHuntPoints", 0] },
-            pvpPoints:        { $ifNull: ["$pvpPoints", 0] },
-            lucky7Points:     { $ifNull: ["$lucky7Points", 0] },
-          }
-        },
-        {
-          $addFields: {
-            totalPoints: {
-              $add: ["$tournamentPoints", "$bonusHuntPoints", "$pvpPoints", "$lucky7Points"]
-            }
-          }
-        },
-        { $sort: { totalPoints: -1, tournamentPoints: -1, bonusHuntPoints: -1, pvpPoints: -1, lucky7Points: -1, username: 1 } },
-        { $limit: limit }
-      ]).toArray();
-
-      let lastKey = null, rank = 0;
-      const ranked = rows.map((r, i) => {
-        const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
-        if (key !== lastKey) { rank = i + 1; lastKey = key; }
-        return { rank, ...r };
-      });
-
-      return res.json({ items: ranked });
-    }
-
-    // file/memory fallback
-    const items = Object.values(memory.profiles || {})
-      .map(p => ({
-        username: p.username,
-        tournamentPoints: Number(p.tournamentPoints || 0),
-        bonusHuntPoints:  Number(p.bonusHuntPoints || 0),
-        pvpPoints:        Number(p.pvpPoints || 0),
-        lucky7Points:     Number(p.lucky7Points || 0),
-      }))
-      .map(r => ({ ...r,
-        totalPoints: r.tournamentPoints + r.bonusHuntPoints + r.pvpPoints + r.lucky7Points
-      }))
-      .sort((a, b) =>
-        (b.totalPoints || 0) - (a.totalPoints || 0) ||
-        (b.tournamentPoints || 0) - (a.tournamentPoints || 0) ||
-        (b.bonusHuntPoints || 0) - (a.bonusHuntPoints || 0) ||
-        (b.pvpPoints || 0) - (a.pvpPoints || 0) ||
-        (b.lucky7Points || 0) - (a.lucky7Points || 0) ||
-        a.username.localeCompare(b.username)
-      )
-      .slice(0, limit);
-
-    let lastKey = null, rank = 0;
-    const ranked = items.map((r, i) => {
-      const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
-      if (key !== lastKey) { rank = i + 1; lastKey = key; }
-      return { rank, ...r };
-    });
-
-    return res.json({ items: ranked });
-  } catch (e) {
-    console.error("[LEADERBOARD] overall list failed", e);
-    return res.status(500).json({ error: "failed" });
-  }
-});
-
 /* ===================== PVP (entries + toggle) ===================== */
 
 // Public: check if entries are open
@@ -1934,4 +1710,3 @@ app.listen(PORT, HOST, () => {
     }
   }
 })();
-
