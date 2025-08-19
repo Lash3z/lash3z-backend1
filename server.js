@@ -82,6 +82,16 @@ function resolveFirstExisting(candidates) {
   }
   return null;
 }
+
+// try to find a profile page for Kick redirects
+const PROFILE_FILE = resolveFirstExisting([
+  process.env.PROFILE_FILE || "pages/dashboard/home/profile.html",
+  "pages/profile.html",
+  "profile.html",
+  "pages/dashboard/home/index.html", // fallback hub/home
+  "index.html"
+]);
+
 const ADMIN_LOGIN_FILE = resolveFirstExisting([
   process.env.ADMIN_LOGIN_FILE || "pages/dashboard/home/admin_login.html",
   "pages/dashboard/home/login.html",
@@ -119,7 +129,6 @@ function scheduleSave() {
     try {
       const data = JSON.stringify(memory, null, 2);
       fs.writeFileSync(STATE_FILE, data);
-      // eslint-disable-next-line no-console
       console.log(`[PERSIST] state saved → ${STATE_FILE}`);
     } catch (e) {
       console.warn("[PERSIST] save failed:", e?.message || e);
@@ -132,9 +141,7 @@ function loadStateIfPresent() {
     if (existsSync(STATE_FILE)) {
       const text = fs.readFileSync(STATE_FILE, "utf8");
       const parsed = JSON.parse(text);
-      // shallow merge; keep schema defaults for new keys
       Object.assign(memory, parsed || {});
-      // eslint-disable-next-line no-console
       console.log(`[PERSIST] state loaded from ${STATE_FILE}`);
     }
   } catch (e) {
@@ -187,9 +194,8 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(compression());
 app.use(morgan(NODE_ENV === "production" ? "tiny" : "dev"));
 
-// security headers & CSP
+// ---- Security headers & CSP (allow inline until you nonce your frontend) ----
 app.use((req, res, next) => {
-  // Quick unblock for inline scripts/styles — replace with nonces later if needed
   res.setHeader(
     "Content-Security-Policy",
     [
@@ -207,8 +213,20 @@ app.use((req, res, next) => {
   next();
 });
 
+// ---- Body parsers (also accept text/plain that contains JSON) ----
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: false }));
+app.use(express.text({ type: "text/plain", limit: "200kb" }));
+app.use((req, _res, next) => {
+  if (typeof req.body === "string") {
+    try {
+      const maybe = JSON.parse(req.body);
+      if (maybe && typeof maybe === "object") req.body = maybe;
+    } catch { /* ignore */ }
+  }
+  next();
+});
+
 app.use(cookieParser());
 
 // CORS for /api
@@ -312,7 +330,8 @@ app.get("/api/health", (req, res) => {
     adminBypass: DISABLE_ADMIN_AUTH,
     kick: {
       configured: !!(KICK_CLIENT_ID && KICK_CLIENT_SECRET && KICK_REDIRECT_URI),
-      redirect: KICK_REDIRECT_URI
+      redirect: KICK_REDIRECT_URI,
+      profileFile: !!PROFILE_FILE
     }
   });
 });
@@ -332,6 +351,13 @@ app.get("/admin/login", (req, res) => {
 app.get("/admin/hub", (req, res) => {
   if (ADMIN_HUB_FILE) return res.sendFile(ADMIN_HUB_FILE);
   res.status(404).send("Admin hub page not found.");
+});
+
+// Serve /profile (so Kick redirects like /profile?kickError=... never 404)
+app.get("/profile", (req, res) => {
+  if (PROFILE_FILE) return res.sendFile(PROFILE_FILE);
+  // fallback: just show a tiny message with the query string
+  res.status(200).send("Profile page not found. Params: " + req.url);
 });
 
 // Admin aliases (file names)
@@ -367,6 +393,7 @@ app.use(express.static(PUBLIC_DIR, {
     }
   }
 }));
+
 /* ======================================================================== */
 /* ===================== WALLET / USER HELPERS ============================ */
 /* ======================================================================== */
@@ -431,25 +458,30 @@ async function getWallet(username) {
   return { username: user, balance: Number(w.balance || 0), signupBonusGrantedAt: w.signupBonusGrantedAt };
 }
 
-// credit/debit
+// credit/debit (resilient: DB error → fallback to memory)
 async function adjustWallet(username, delta, reason = "adjust") {
   const user = U(username);
   const amount = Number(delta || 0);
   if (!user || !Number.isFinite(amount)) return { ok: false, error: "bad_params" };
 
   if (globalThis.__dbReady) {
-    const col = globalThis.__db.collection("wallets");
-    const tx  = { ts: nowISO(), delta: amount, reason };
-    const r = await col.findOneAndUpdate(
-      { username: user },
-      {
-        $setOnInsert: { username: user, balance: 0, ledger: [], signupBonusGrantedAt: null },
-        $inc: { balance: amount },
-        $push: { ledger: tx }
-      },
-      { upsert: true, returnDocument: "after" }
-    );
-    return { ok: true, balance: Number(r.value?.balance || 0) };
+    try {
+      const col = globalThis.__db.collection("wallets");
+      const tx  = { ts: nowISO(), delta: amount, reason };
+      const r = await col.findOneAndUpdate(
+        { username: user },
+        {
+          $setOnInsert: { username: user, balance: 0, ledger: [], signupBonusGrantedAt: null },
+          $inc: { balance: amount },
+          $push: { ledger: tx }
+        },
+        { upsert: true, returnDocument: "after" }
+      );
+      return { ok: true, balance: Number(r.value?.balance || 0) };
+    } catch (e) {
+      console.warn("[wallet] mongo adjust failed, falling back:", e?.message || e);
+      // fall through to memory/file
+    }
   }
 
   // file/memory
@@ -521,12 +553,20 @@ async function userCreate(username, passHash) {
 
 /* ===================== Wallet + Viewer APIs ===================== */
 function walletAdjustHandler(req, res){
-  const u = String(req.body?.username || req.body?.user || req.body?.name || "").toUpperCase();
-  const delta = Number(req.body?.delta || req.body?.amount || 0);
-  if (!u) return res.status(400).json({ error: "username required" });
-  adjustWallet(u, delta, "admin_adjust")
-    .then(r => res.json({ success: true, balance: r.balance }))
-    .catch(() => res.status(500).json({ error: "failed" }));
+  try {
+    const body = (req && req.body && typeof req.body === "object") ? req.body : {};
+    const u = String(body.username || body.user || body.name || "").toUpperCase();
+    const delta = Number(body.delta || body.amount || 0);
+    const reason = String(body.reason || "admin_adjust");
+    if (!u) return res.status(400).json({ ok:false, error: "username required" });
+    if (!Number.isFinite(delta)) return res.status(400).json({ ok:false, error: "delta must be a number" });
+    adjustWallet(u, delta, reason)
+      .then(r => r?.ok ? res.json({ ok:true, success: true, balance: r.balance }) : res.status(500).json({ ok:false, error: r.error || "failed" }))
+      .catch(e => { console.error("[/api/wallet/adjust] error:", e); res.status(500).json({ ok:false, error:"server_error" }); });
+  } catch (e) {
+    console.error("[/api/wallet/adjust] handler exception:", e);
+    res.status(500).json({ ok:false, error: "handler_exception" });
+  }
 }
 app.post("/api/wallet/adjust", verifyAdminToken, walletAdjustHandler);
 app.post("/api/admin/wallet/adjust", verifyAdminToken, walletAdjustHandler);
@@ -639,9 +679,7 @@ app.post("/api/viewer/logout", (req, res) => {
   res.clearCookie("viewer", { path: "/" });
   res.clearCookie("admin_token", { path: "/" });
   res.json({ success: true });
-});
-
-/* ===================== Kick OAuth Linking ===================== */
+});/* ===================== Kick OAuth Linking ===================== */
 /** We persist PKCE verifier + state in a secure, httpOnly cookie to avoid
  *  'invalid_state' if the process restarts or a different instance handles
  *  the callback. */
@@ -676,6 +714,14 @@ function readPkceCookie(req) {
     if (!obj || typeof obj !== "object") return null;
     return obj;
   } catch { return null; }
+}
+
+// small helper to consistently redirect to a profile page or root
+function redirectToProfile(res, query) {
+  const qs = new URLSearchParams(query || {}).toString();
+  const suffix = qs ? `?${qs}` : "";
+  if (PROFILE_FILE) return res.redirect(`/profile${suffix}`);
+  return res.redirect(`/${suffix}`);
 }
 
 /** Save Kick link for a viewer */
@@ -756,15 +802,15 @@ app.get("/auth/kick", requireViewer, (req, res) => {
 app.get("/auth/kick/callback", async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query;
-    if (error) return res.redirect(`/profile?kickError=${encodeURIComponent(error_description || error)}`);
+    if (error) return redirectToProfile(res, { kickError: error_description || error });
 
     const stored = readPkceCookie(req);
     res.clearCookie(PKCE_COOKIE, { path: "/" });
 
     if (!stored || !stored.state || stored.state !== state) {
-      return res.redirect(`/profile?kickError=invalid_state`);
+      return redirectToProfile(res, { kickError: "invalid_state" });
     }
-    if (!code) return res.redirect(`/profile?kickError=missing_code`);
+    if (!code) return redirectToProfile(res, { kickError: "missing_code" });
 
     const body = new URLSearchParams({
       grant_type: "authorization_code",
@@ -780,29 +826,36 @@ app.get("/auth/kick/callback", async (req, res) => {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body
     });
-    const tokens = await tokRes.json();
+    const tokens = await tokRes.json().catch(() => ({}));
     if (!tokRes.ok || !tokens?.access_token) {
-      return res.redirect(`/profile?kickError=token_exchange_failed`);
+      console.warn("[Kick OAuth] token exchange failed:", tokens);
+      return redirectToProfile(res, { kickError: "token_exchange_failed" });
     }
 
     const meRes = await fetch(`${KICK_API_BASE}/users/me`, {
       headers: { Authorization: `Bearer ${tokens.access_token}` }
     });
-    const profile = await meRes.json();
+    const profile = await meRes.json().catch(() => ({}));
     if (!meRes.ok || !profile?.id) {
-      return res.redirect(`/profile?kickError=user_fetch_failed`);
+      console.warn("[Kick OAuth] user fetch failed:", profile);
+      return redirectToProfile(res, { kickError: "user_fetch_failed" });
     }
 
     await saveKickLink(stored.viewer, profile /*, tokens*/);
 
-    res.redirect(`/profile?kickLinked=1`);
+    return redirectToProfile(res, { kickLinked: "1" });
   } catch (e) {
     console.error("[Kick OAuth] callback error:", e);
-    res.redirect(`/profile?kickError=exception`);
+    return redirectToProfile(res, { kickError: "exception" });
   }
 });
 
 // Link status (for the current viewer)
+app.get("/api/kkick/status", requireViewer, async (req, res) => {
+  // legacy alias kept for safety: prefer /api/kick/status (typo-safe)
+  const k = await getKickLink(req.viewer);
+  res.json({ ok: true, linked: !!k, kick: k || null });
+});
 app.get("/api/kick/status", requireViewer, async (req, res) => {
   const k = await getKickLink(req.viewer);
   res.json({ ok: true, linked: !!k, kick: k || null });
@@ -814,7 +867,7 @@ app.post("/api/kick/unlink", requireViewer, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ===================== JACKPOT API (NEW) ===================== */
+/* ===================== JACKPOT API (PUBLIC + ADMIN) ===================== */
 // Public: read current jackpot
 app.get("/api/jackpot", (req, res) => {
   const j = memory.jackpot || { amount: 0, month: currentMonth(), perSubAUD: 2.5, currency: "AUD" };
@@ -872,6 +925,7 @@ app.post("/api/lbx/orders", (req, res) => {
   scheduleSave();
   res.json({ success: true, order: o });
 });
+
 /* ===================== Raffles / Giveaways (admin shims) ===================== */
 function ensureRaffle(rid){
   let r = (memory.raffles||[]).find(x => x.rid === rid);
@@ -936,6 +990,7 @@ app.post("/api/prize-claims/:id/status", verifyAdminToken, (req, res) => {
   scheduleSave();
   res.json({ success: true });
 });
+
 /* ===================== PVP (entries + toggle) ===================== */
 
 // Public: check if entries are open
@@ -1157,14 +1212,17 @@ app.post("/api/pvp/bracket/progress", verifyAdminToken, async (req, res) => {
     const lastRoundIndex = sideArr.length - 1;
     if (rIdx < lastRoundIndex){
       const nextRound = sideArr[rIdx + 1];
-      const target = nextRound[nextIndex(mIdx)];
+      const target = nextRound[Math.floor(mIdx/2)];
       const slot = (mIdx % 2 === 0) ? "left" : "right";
-      putIntoSlot(target, slot, advPlayer);
+      if (target) {
+        if (slot==="left") target.left  = { ...(target.left||{}),  ...advPlayer };
+        else                target.right = { ...(target.right||{}), ...advPlayer };
+      }
     } else {
       const gf = (b.bracket.finals && b.bracket.finals[0] && b.bracket.finals[0][0]) ? b.bracket.finals[0][0] : null;
       if (gf){
-        if (phase==="east") putIntoSlot(gf, "left", advPlayer);
-        if (phase==="west") putIntoSlot(gf, "right", advPlayer);
+        if (phase==="east") { gf.left  = { ...(gf.left||{}),  ...advPlayer }; }
+        if (phase==="west") { gf.right = { ...(gf.right||{}), ...advPlayer }; }
         if (phase==="finals"){ b.bracket.champion = { name: advPlayer.name }; }
       }
     }
@@ -1413,7 +1471,6 @@ app.get("/api/bets/published", (req, res) => {
   if (kind) items = items.filter(x => String(x.kind || "").toLowerCase() === kind);
   res.json({ ok: true, items, ts: Date.now() });
 });
-
 /* ===================== LBX PROMO CODES — ADMIN ===================== */
 app.post("/api/admin/promo/create", verifyAdminToken, async (req, res) => {
   try {
@@ -1624,6 +1681,274 @@ app.get("/api/promo/my-redemptions", requireViewer, async (req, res) => {
   }
 });
 
+/* ===================== Leaderboard (monthly + lifetime) ===================== */
+app.post("/api/leaderboard/upsert", verifyAdminToken, async (req, res) => {
+  const user = String(req.body?.user || req.body?.username || "").toUpperCase();
+  if (!user) return res.status(400).json({ error: "username required" });
+
+  const mode = String(req.body?.mode || "tournament").toLowerCase();
+  const fieldMap = {
+    tournament: "tournamentPoints",
+    bonus:      "bonusHuntPoints",
+    pvp:        "pvpPoints",
+    lucky7:     "lucky7Points",
+  };
+  const field = fieldMap[mode] || "tournamentPoints";
+
+  const delta = Number(
+    req.body?.delta ??
+    req.body?.deltaTournamentPoints ??
+    0
+  );
+  const actions = Array.isArray(req.body?.actions) ? req.body.actions : [];
+  const month = String(req.body?.month || currentMonth());
+
+  try {
+    if (globalThis.__dbReady) {
+      const db = globalThis.__db;
+
+      // 1) Cumulative lifetime in profiles
+      const profiles = db.collection("profiles");
+      const cumInc = { [field]: delta };
+      const r1 = await profiles.findOneAndUpdate(
+        { username: user },
+        {
+          $setOnInsert: {
+            username: user,
+            tournamentPoints: 0,
+            bonusHuntPoints:  0,
+            pvpPoints:        0,
+            lucky7Points:     0,
+            history: []
+          },
+          $inc: cumInc,
+          $push: { history: { ts: new Date(), mode, added: delta, actions } }
+        },
+        { upsert: true, returnDocument: "after" }
+      );
+
+      // 2) Monthly bucket in leaderboard_monthly
+      const monthly = db.collection("leaderboard_monthly");
+      const r2 = await monthly.findOneAndUpdate(
+        { username: user, month },
+        {
+          $setOnInsert: {
+            username: user,
+            month,
+            tournamentPoints: 0,
+            bonusHuntPoints:  0,
+            pvpPoints:        0,
+            lucky7Points:     0,
+            totalPoints:      0,
+            history: []
+          },
+          $inc: { [field]: delta, totalPoints: delta },
+          $push: { history: { ts: new Date(), mode, added: delta, actions } }
+        },
+        { upsert: true, returnDocument: "after" }
+      );
+
+      return res.json({
+        success: true,
+        cumulative: {
+          username: r1.value.username,
+          tournamentPoints: Number(r1.value.tournamentPoints || 0),
+          bonusHuntPoints:  Number(r1.value.bonusHuntPoints  || 0),
+          pvpPoints:        Number(r1.value.pvpPoints        || 0),
+          lucky7Points:     Number(r1.value.lucky7Points     || 0)
+        },
+        monthly: {
+          username: r2.value.username,
+          month: r2.value.month,
+          tournamentPoints: Number(r2.value.tournamentPoints || 0),
+          bonusHuntPoints:  Number(r2.value.bonusHuntPoints  || 0),
+          pvpPoints:        Number(r2.value.pvpPoints        || 0),
+          lucky7Points:     Number(r2.value.lucky7Points     || 0),
+          totalPoints:      Number(r2.value.totalPoints      || 0)
+        }
+      });
+    } else {
+      // ===== File/Memory fallback =====
+      // cumulative
+      const p = memory.profiles[user] || {
+        username: user,
+        tournamentPoints: 0,
+        bonusHuntPoints:  0,
+        pvpPoints:        0,
+        lucky7Points:     0,
+        history: []
+      };
+      p[field] = Number(p[field] || 0) + delta;
+      p.history.unshift({ ts: Date.now(), mode, added: delta, actions });
+      memory.profiles[user] = p;
+
+      // monthly
+      memory.monthlyLB[month] = memory.monthlyLB[month] || {};
+      const mrec = memory.monthlyLB[month][user] || {
+        username: user,
+        month,
+        tournamentPoints: 0,
+        bonusHuntPoints:  0,
+        pvpPoints:        0,
+        lucky7Points:     0,
+        totalPoints:      0,
+        history: []
+      };
+      mrec[field] = Number(mrec[field] || 0) + delta;
+      mrec.totalPoints = Number(mrec.totalPoints || 0) + delta;
+      mrec.history.unshift({ ts: Date.now(), mode, added: delta, actions });
+      memory.monthlyLB[month][user] = mrec;
+
+      scheduleSave();
+      return res.json({
+        success: true,
+        cumulative: {
+          username: p.username,
+          tournamentPoints: p.tournamentPoints,
+          bonusHuntPoints:  p.bonusHuntPoints,
+          pvpPoints:        p.pvpPoints,
+          lucky7Points:     p.lucky7Points
+        },
+        monthly: mrec
+      });
+    }
+  } catch (e) {
+    console.error("[LEADERBOARD] upsert failed", e);
+    return res.status(500).json({ error: "failed" });
+  }
+});
+app.post("/api/admin/leaderboard/rebuild", verifyAdminToken, (req,res)=> res.json({ success:true }));
+
+// Read: monthly leaderboard (auto "resets" by month bucket)
+app.get("/api/leaderboard/monthly", async (req, res) => {
+  const month = String(req.query.month || currentMonth());
+  const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 200)));
+
+  try {
+    if (globalThis.__dbReady) {
+      const col = globalThis.__db.collection("leaderboard_monthly");
+      const rows = await col.find({ month })
+        .project({
+          _id: 0, username: 1, month: 1,
+          tournamentPoints: 1, bonusHuntPoints: 1, pvpPoints: 1, lucky7Points: 1,
+          totalPoints: 1
+        })
+        .sort({ totalPoints: -1, tournamentPoints: -1, bonusHuntPoints: -1, pvpPoints: -1, lucky7Points: -1, username: 1 })
+        .limit(limit)
+        .toArray();
+
+      // dense rank
+      let lastKey = null, rank = 0;
+      const ranked = rows.map((r, i) => {
+        const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
+        if (key !== lastKey) { rank = i + 1; lastKey = key; }
+        return { rank, ...r };
+      });
+
+      return res.json({ month, items: ranked });
+    }
+
+    // file/memory fallback
+    const bucket = memory.monthlyLB[month] || {};
+    const items = Object.values(bucket)
+      .sort((a, b) =>
+        (b.totalPoints || 0) - (a.totalPoints || 0) ||
+        (b.tournamentPoints || 0) - (a.tournamentPoints || 0) ||
+        (b.bonusHuntPoints || 0) - (a.bonusHuntPoints || 0) ||
+        (b.pvpPoints || 0) - (a.pvpPoints || 0) ||
+        (b.lucky7Points || 0) - (a.lucky7Points || 0) ||
+        a.username.localeCompare(b.username)
+      )
+      .slice(0, limit);
+
+    let lastKey = null, rank = 0;
+    const ranked = items.map((r, i) => {
+      const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
+      if (key !== lastKey) { rank = i + 1; lastKey = key; }
+      return { rank, ...r };
+    });
+
+    return res.json({ month, items: ranked });
+  } catch (e) {
+    console.error("[LEADERBOARD] monthly list failed", e);
+    return res.status(500).json({ error: "failed" });
+  }
+});
+
+// Read: lifetime (overall) leaderboard
+app.get("/api/leaderboard/overall", async (req, res) => {
+  const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 200)));
+
+  try {
+    if (globalThis.__dbReady) {
+      const col = globalThis.__db.collection("profiles");
+      const rows = await col.aggregate([
+        {
+          $project: {
+            _id: 0, username: 1,
+            tournamentPoints: { $ifNull: ["$tournamentPoints", 0] },
+            bonusHuntPoints:  { $ifNull: ["$bonusHuntPoints", 0] },
+            pvpPoints:        { $ifNull: ["$pvpPoints", 0] },
+            lucky7Points:     { $ifNull: ["$lucky7Points", 0] },
+          }
+        },
+        {
+          $addFields: {
+            totalPoints: {
+              $add: ["$tournamentPoints", "$bonusHuntPoints", "$pvpPoints", "$lucky7Points"]
+            }
+          }
+        },
+        { $sort: { totalPoints: -1, tournamentPoints: -1, bonusHuntPoints: -1, pvpPoints: -1, lucky7Points: -1, username: 1 } },
+        { $limit: limit }
+      ]).toArray();
+
+      let lastKey = null, rank = 0;
+      const ranked = rows.map((r, i) => {
+        const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
+        if (key !== lastKey) { rank = i + 1; lastKey = key; }
+        return { rank, ...r };
+      });
+
+      return res.json({ items: ranked });
+    }
+
+    // file/memory fallback
+    const items = Object.values(memory.profiles || {})
+      .map(p => ({
+        username: p.username,
+        tournamentPoints: Number(p.tournamentPoints || 0),
+        bonusHuntPoints:  Number(p.bonusHuntPoints || 0),
+        pvpPoints:        Number(p.pvpPoints || 0),
+        lucky7Points:     Number(p.lucky7Points || 0),
+      }))
+      .map(r => ({ ...r,
+        totalPoints: r.tournamentPoints + r.bonusHuntPoints + r.pvpPoints + r.lucky7Points
+      }))
+      .sort((a, b) =>
+        (b.totalPoints || 0) - (a.totalPoints || 0) ||
+        (b.tournamentPoints || 0) - (a.tournamentPoints || 0) ||
+        (b.bonusHuntPoints || 0) - (a.bonusHuntPoints || 0) ||
+        (b.pvpPoints || 0) - (a.pvpPoints || 0) ||
+        (b.lucky7Points || 0) - (a.lucky7Points || 0) ||
+        a.username.localeCompare(b.username)
+      )
+      .slice(0, limit);
+
+    let lastKey = null, rank = 0;
+    const ranked = items.map((r, i) => {
+      const key = `${r.totalPoints}|${r.tournamentPoints}|${r.bonusHuntPoints}|${r.pvpPoints}|${r.lucky7Points}`;
+      if (key !== lastKey) { rank = i + 1; lastKey = key; }
+      return { rank, ...r };
+    });
+
+    return res.json({ items: ranked });
+  } catch (e) {
+    console.error("[LEADERBOARD] overall list failed", e);
+    return res.status(500).json({ error: "failed" });
+  }
+});
+
 /* ===================== 404 / Error ===================== */
 app.use((req, res) => res.status(404).send("Not found."));
 app.use((err, req, res, next) => {
@@ -1710,3 +2035,4 @@ app.listen(PORT, HOST, () => {
     }
   }
 })();
+
