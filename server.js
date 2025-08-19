@@ -194,6 +194,12 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(compression());
 app.use(morgan(NODE_ENV === "production" ? "tiny" : "dev"));
 
+// Per-instance header (helps spot multi-instance drift during testing)
+app.use((req, res, next) => {
+  res.setHeader("X-Instance", process.pid.toString());
+  next();
+});
+
 // ---- Security headers & CSP (allow inline until you nonce your frontend) ----
 app.use((req, res, next) => {
   res.setHeader(
@@ -447,6 +453,7 @@ async function getWallet(username) {
         signupBonusGrantedAt: found.signupBonusGrantedAt ?? null
       };
     }
+    // create empty wallet on first touch
     const fresh = { username: user, balance: 0, ledger: [], signupBonusGrantedAt: null };
     await col.insertOne(fresh);
     return { username: user, balance: 0, signupBonusGrantedAt: null };
@@ -571,6 +578,19 @@ function walletAdjustHandler(req, res){
 app.post("/api/wallet/adjust", verifyAdminToken, walletAdjustHandler);
 app.post("/api/admin/wallet/adjust", verifyAdminToken, walletAdjustHandler);
 
+// NEW: Admin inspect endpoint — see server-truth for a user
+app.get("/api/admin/wallet/inspect", verifyAdminToken, async (req, res) => {
+  const user = String(req.query.user || req.query.username || "").toUpperCase();
+  if (!user) return res.status(400).json({ error: "username required" });
+  try {
+    const w = await getWallet(user);
+    return res.json({ success: true, username: w.username || user, balance: Number(w.balance || 0) });
+  } catch (e) {
+    console.error("[wallet/inspect]", e);
+    return res.status(500).json({ error: "failed" });
+  }
+});
+
 app.post("/api/wallet/credit", verifyAdminToken, async (req, res) => {
   const u = String(req.body?.username || req.body?.user || req.body?.name || "").toUpperCase();
   const amount = Number(req.body?.amount || 0);
@@ -679,7 +699,8 @@ app.post("/api/viewer/logout", (req, res) => {
   res.clearCookie("viewer", { path: "/" });
   res.clearCookie("admin_token", { path: "/" });
   res.json({ success: true });
-});/* ===================== Kick OAuth Linking ===================== */
+});
+/* ===================== Kick OAuth Linking ===================== */
 /** We persist PKCE verifier + state in a secure, httpOnly cookie to avoid
  *  'invalid_state' if the process restarts or a different instance handles
  *  the callback. */
@@ -991,109 +1012,215 @@ app.post("/api/prize-claims/:id/status", verifyAdminToken, (req, res) => {
   res.json({ success: true });
 });
 
-/* ===================== PVP (entries + toggle) ===================== */
-
-// Public: check if entries are open
-app.get("/api/pvp/entries/open", (req,res)=>{
-  res.json({ open: !!memory.flags.pvpEntriesOpen });
-});
-
-// Admin: open/close entries
-app.post("/api/admin/pvp/entries/open", verifyAdminToken, (req,res)=>{
-  const open = !!req.body?.open;
-  memory.flags.pvpEntriesOpen = open;
-  scheduleSave();
-  res.json({ success:true, open });
-});
-
-app.post("/api/pvp/entries", async (req, res) => {
-  const username = String(req.body?.username || req.body?.user || "").trim().toUpperCase();
-  const side     = String(req.body?.side || "").trim().toUpperCase();
-  const game     = String(req.body?.game || "").trim();
-  if (!username) return res.status(400).json({ error: "username required" });
-
-  if (!memory.flags.pvpEntriesOpen) return res.status(403).json({ error: "entries_closed" });
-
-  const doc = { username, side: side==="WEST" ? "WEST" : "EAST", game, status: "pending", ts: new Date() };
+/* ===================== LBX PROMO CODES — ADMIN ===================== */
+app.post("/api/admin/promo/create", verifyAdminToken, async (req, res) => {
   try {
+    let { code, amount, maxRedemptions=1, perUserLimit=1, expiresAt=null, notes="" } = req.body || {};
+    amount = Number(amount);
+    maxRedemptions = Number(maxRedemptions);
+    perUserLimit = Number(perUserLimit);
+
+    if (!PROMO_ALLOWED_AMOUNTS.has(amount)) return res.status(400).json({ ok:false, error:"INVALID_AMOUNT" });
+    if (maxRedemptions < 1 || perUserLimit < 1) return res.status(400).json({ ok:false, error:"LIMITS_INVALID" });
+
+    const now = new Date();
+    const doc = {
+      code: normCode(code || `L3Z-${amount}-${crypto.randomBytes(4).toString("hex").slice(0,6).toUpperCase()}`),
+      amount,
+      maxRedemptions,
+      perUserLimit,
+      redeemedCount: 0,
+      active: true,
+      expiresAt: expiresAt ? new Date(expiresAt) : null,
+      createdBy: req.adminUser || "admin",
+      notes: String(notes || ""),
+      createdAt: now,
+      updatedAt: now,
+    };
+
     if (globalThis.__dbReady) {
-      const col = globalThis.__db.collection("pvp_entries");
-      const existing = await col.findOne({ username });
-      if (existing) return res.status(409).json({ error: "duplicate", entry: existing });
-      const r = await col.insertOne(doc);
-      const saved = await col.findOne({ _id: r.insertedId });
-      return res.json({ success: true, entry: saved });
+      await globalThis.__db.collection("promo_codes").insertOne(doc);
     } else {
-      const exists = (memory.pvpEntries||[]).find(e => e.username === username);
-      if (exists) return res.status(409).json({ error: "duplicate", entry: exists });
-      const saved = { _id: String(Date.now()), ...doc };
-      memory.pvpEntries.push(saved);
+      if ((memory.promoCodes||[]).some(p => p.code === doc.code)) return res.status(409).json({ ok:false, error:"CODE_EXISTS" });
+      memory.promoCodes.unshift(doc);
       scheduleSave();
-      return res.json({ success: true, entry: saved });
     }
+    res.json({ ok:true, code: doc.code, promo: doc });
   } catch (e) {
-    console.error("[PVP] save failed", e);
-    return res.status(500).json({ error: "save failed" });
-  }
-});
-app.get("/api/pvp/entries", verifyAdminToken, async (req, res) => {
-  try {
-    if (globalThis.__dbReady) {
-      const list = await globalThis.__db.collection("pvp_entries").find().sort({ ts: -1 }).toArray();
-      return res.json({ entries: list });
-    } else {
-      const list = [...(memory.pvpEntries||[])].sort((a,b)=> new Date(b.ts) - new Date(a.ts));
-      return res.json({ entries: list });
-    }
-  } catch (e) {
-    console.error("[PVP] list failed", e);
-    return res.status(500).json({ error: "list failed" });
-  }
-});
-app.post("/api/pvp/entries/:id/status", verifyAdminToken, async (req, res) => {
-  const status = String(req.body?.status || "").toLowerCase();
-  if (!["approved","rejected","pending"].includes(status)) return res.status(400).json({ error: "bad status" });
-  try {
-    if (globalThis.__dbReady) {
-      const col = globalThis.__db.collection("pvp_entries");
-      const id = req.params.id;
-      const q = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { username: id.toUpperCase() };
-      const r = await col.updateOne(q, { $set: { status } });
-      return res.json({ success: r.matchedCount > 0 });
-    } else {
-      const id = req.params.id;
-      const i = (memory.pvpEntries||[]).findIndex(e => e._id === id || e.username === id.toUpperCase());
-      if (i < 0) return res.json({ success: false });
-      memory.pvpEntries[i].status = status;
-      scheduleSave();
-      return res.json({ success: true });
-    }
-  } catch (e) {
-    console.error("[PVP] status failed", e);
-    return res.status(500).json({ error: "status failed" });
-  }
-});
-app.delete("/api/pvp/entries/:id", verifyAdminToken, async (req, res) => {
-  try {
-    if (globalThis.__dbReady) {
-      const col = globalThis.__db.collection("pvp_entries");
-      const id = req.params.id;
-      const q = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { username: id.toUpperCase() };
-      const r = await col.deleteOne(q);
-      return res.json({ success: r.deletedCount > 0 });
-    } else {
-      const id = req.params.id;
-      const before = (memory.pvpEntries||[]).length;
-      memory.pvpEntries = (memory.pvpEntries||[]).filter(e => e._id !== id && e.username !== id.toUpperCase());
-      scheduleSave();
-      return res.json({ success: (memory.pvpEntries||[]).length !== before });
-    }
-  } catch (e) {
-    console.error("[PVP] delete failed", e);
-    return res.status(500).json({ error: "delete failed" });
+    if (e?.code === 11000) return res.status(409).json({ ok:false, error:"CODE_EXISTS" });
+    console.error("[promo/create]", e);
+    res.status(500).json({ ok:false, error:"SERVER" });
   }
 });
 
+app.post("/api/admin/promo/generate", verifyAdminToken, async (req, res) => {
+  try {
+    let { prefix = "L3Z", amount, count, maxRedemptions=1, perUserLimit=1, expiresAt=null, notes="" } = req.body || {};
+    amount = Number(amount);
+    count = Math.min(5000, Number(count || 1));
+    if (!PROMO_ALLOWED_AMOUNTS.has(amount)) return res.status(400).json({ ok:false, error:"INVALID_AMOUNT" });
+    if (count < 1) return res.status(400).json({ ok:false, error:"COUNT_INVALID" });
+
+    const now = new Date();
+    const mkCode = () => `${normCode(prefix)}-${amount}-${crypto.randomBytes(6).toString("base64").replace(/[^A-Z0-9]/gi,"").slice(0,7).toUpperCase()}`;
+
+    if (globalThis.__dbReady) {
+      const pc = globalThis.__db.collection("promo_codes");
+      const docs = Array.from({ length: count }).map(() => ({
+        code: mkCode(),
+        amount,
+        maxRedemptions: Number(maxRedemptions),
+        perUserLimit: Number(perUserLimit),
+        redeemedCount: 0,
+        active: true,
+        expiresAt: expiresAt ? new Date(expiresAt) : null,
+        createdBy: req.adminUser || "admin",
+        notes: String(notes || ""),
+        createdAt: now,
+        updatedAt: now,
+      }));
+      await pc.insertMany(docs, { ordered: false });
+      return res.json({ ok:true, generated: docs.length, sample: docs.slice(0,5).map(d=>d.code) });
+    } else {
+      const docs = [];
+      for (let i=0;i<count;i++){
+        let c; do { c = mkCode(); } while ((memory.promoCodes||[]).some(p => p.code === c));
+        docs.push({
+          code: c, amount,
+          maxRedemptions: Number(maxRedemptions),
+          perUserLimit: Number(perUserLimit),
+          redeemedCount: 0,
+          active: true,
+          expiresAt: expiresAt ? new Date(expiresAt) : null,
+          createdBy: req.adminUser || "admin",
+          notes: String(notes || ""),
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+      memory.promoCodes = [...docs, ...(memory.promoCodes||[])];
+      scheduleSave();
+      return res.json({ ok:true, generated: docs.length, sample: docs.slice(0,5).map(d=>d.code) });
+    }
+  } catch (e) {
+    console.error("[promo/generate]", e);
+    res.status(500).json({ ok:false, error:"SERVER" });
+  }
+});
+
+// List / disable
+app.get("/api/admin/promo/list", verifyAdminToken, async (req, res) => {
+  const only = "active" in req.query ? (req.query.active === "1") : null;
+  if (globalThis.__dbReady) {
+    const q = only === null ? {} : { active: only };
+    const items = await globalThis.__db.collection("promo_codes").find(q).sort({ createdAt: -1 }).limit(500).toArray();
+    return res.json({ ok:true, items });
+  } else {
+    let items = [...(memory.promoCodes||[])];
+    if (only !== null) items = items.filter(p => !!p.active === only);
+    return res.json({ ok:true, items });
+  }
+});
+app.post("/api/admin/promo/disable", verifyAdminToken, async (req, res) => {
+  const code = normCode(req.body?.code || "");
+  if (!code) return res.status(400).json({ ok:false, error:"CODE_REQUIRED" });
+  if (globalThis.__dbReady) {
+    const r = await globalThis.__db.collection("promo_codes").updateOne({ code }, { $set: { active:false, updatedAt: new Date() } });
+    return res.json({ ok:true, modified: r.modifiedCount });
+  } else {
+    const i = (memory.promoCodes||[]).findIndex(p => p.code === code);
+    if (i >= 0) memory.promoCodes[i].active = false;
+    scheduleSave();
+    return res.json({ ok:true, modified: i >= 0 ? 1 : 0 });
+  }
+});
+
+/* ===================== LBX PROMO CODES — USER ===================== */
+app.post("/api/promo/redeem", requireViewer, tinyRateLimit(), async (req, res) => {
+  try {
+    const code = normCode(req.body?.code || "");
+    if (!code) return res.status(400).json({ ok:false, error:"CODE_REQUIRED" });
+    const username = req.viewer;
+
+    const now = new Date();
+
+    if (globalThis.__dbReady) {
+      const pc = globalThis.__db.collection("promo_codes");
+      const pr = globalThis.__db.collection("promo_redemptions");
+
+      const promo = await pc.findOne({ code });
+      if (!promo || !promo.active) return res.status(404).json({ ok:false, error:"INVALID_CODE" });
+      if (promo.expiresAt && promo.expiresAt < now) return res.status(410).json({ ok:false, error:"EXPIRED" });
+      if (promo.redeemedCount >= promo.maxRedemptions) return res.status(409).json({ ok:false, error:"DEPLETED" });
+
+      const prior = await pr.countDocuments({ code, username });
+      if (prior >= (promo.perUserLimit || 1)) return res.status(409).json({ ok:false, error:"PER_USER_LIMIT" });
+
+      try {
+        await pr.insertOne({ code, username, amount: Number(promo.amount||0), createdAt: now });
+      } catch {
+        return res.status(409).json({ ok:false, error:"ALREADY_REDEEMED" });
+      }
+
+      const up = await pc.updateOne(
+        { _id: promo._id, redeemedCount: { $lt: promo.maxRedemptions } },
+        { $inc: { redeemedCount: 1 }, $set: { updatedAt: now } }
+      );
+      if (up.modifiedCount !== 1) {
+        await pr.deleteOne({ code, username }); // rollback
+        return res.status(409).json({ ok:false, error:"DEPLETED" });
+      }
+
+      const credited = await adjustWallet(username, Number(promo.amount||0), `promo:${code}`);
+      if (!credited?.ok) {
+        await pc.updateOne({ _id: promo._id }, { $inc: { redeemedCount: -1 } });
+        await pr.deleteOne({ code, username });
+        return res.status(500).json({ ok:false, error:"CREDIT_FAILED" });
+      }
+
+      return res.json({ ok:true, added: Number(promo.amount||0), code, balance: credited.balance });
+    }
+
+    // ===== FILE/MEMORY MODE =====
+    const promo = (memory.promoCodes||[]).find(p => p.code === code);
+    if (!promo || !promo.active) return res.status(404).json({ ok:false, error:"INVALID_CODE" });
+    if (promo.expiresAt && promo.expiresAt < now) return res.status(410).json({ ok:false, error:"EXPIRED" });
+
+    if (promo.redeemedCount >= promo.maxRedemptions) return res.status(409).json({ ok:false, error:"DEPLETED" });
+
+    const userClaims = (memory.promoRedemptions||[]).filter(r => r.code === code && r.username === username).length;
+    if (userClaims >= (promo.perUserLimit || 1)) return res.status(409).json({ ok:false, error:"PER_USER_LIMIT" });
+
+    // reserve
+    promo.redeemedCount++;
+    memory.promoRedemptions.unshift({ code, username, amount: Number(promo.amount||0), createdAt: now });
+
+    const credited = await adjustWallet(username, Number(promo.amount||0), `promo:${code}`);
+    if (!credited?.ok) {
+      promo.redeemedCount = Math.max(0, promo.redeemedCount - 1);
+      memory.promoRedemptions = (memory.promoRedemptions||[]).filter(r => !(r.code === code && r.username === username));
+      scheduleSave();
+      return res.status(500).json({ ok:false, error:"CREDIT_FAILED" });
+    }
+    scheduleSave();
+    return res.json({ ok:true, added: Number(promo.amount||0), code, balance: credited.balance });
+  } catch (e) {
+    console.error("[promo/redeem]", e);
+    res.status(500).json({ ok:false, error:"SERVER" });
+  }
+});
+
+app.get("/api/promo/my-redemptions", requireViewer, async (req, res) => {
+  const username = req.viewer;
+  if (globalThis.__dbReady) {
+    const rows = await globalThis.__db.collection("promo_redemptions")
+      .find({ username }).sort({ createdAt: -1 }).limit(200).toArray();
+    return res.json({ ok:true, items: rows });
+  } else {
+    const rows = (memory.promoRedemptions||[]).filter(r => r.username === username);
+    return res.json({ ok:true, items: rows });
+  }
+});
 /* ===================== PVP Bracket + LIVE BG/Bonus ===================== */
 function nowMs(){ return Date.now(); }
 function emptyRound(n){
@@ -1471,215 +1598,6 @@ app.get("/api/bets/published", (req, res) => {
   if (kind) items = items.filter(x => String(x.kind || "").toLowerCase() === kind);
   res.json({ ok: true, items, ts: Date.now() });
 });
-/* ===================== LBX PROMO CODES — ADMIN ===================== */
-app.post("/api/admin/promo/create", verifyAdminToken, async (req, res) => {
-  try {
-    let { code, amount, maxRedemptions=1, perUserLimit=1, expiresAt=null, notes="" } = req.body || {};
-    amount = Number(amount);
-    maxRedemptions = Number(maxRedemptions);
-    perUserLimit = Number(perUserLimit);
-
-    if (!PROMO_ALLOWED_AMOUNTS.has(amount)) return res.status(400).json({ ok:false, error:"INVALID_AMOUNT" });
-    if (maxRedemptions < 1 || perUserLimit < 1) return res.status(400).json({ ok:false, error:"LIMITS_INVALID" });
-
-    const now = new Date();
-    const doc = {
-      code: normCode(code || `L3Z-${amount}-${crypto.randomBytes(4).toString("hex").slice(0,6).toUpperCase()}`),
-      amount,
-      maxRedemptions,
-      perUserLimit,
-      redeemedCount: 0,
-      active: true,
-      expiresAt: expiresAt ? new Date(expiresAt) : null,
-      createdBy: req.adminUser || "admin",
-      notes: String(notes || ""),
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    if (globalThis.__dbReady) {
-      await globalThis.__db.collection("promo_codes").insertOne(doc);
-    } else {
-      if ((memory.promoCodes||[]).some(p => p.code === doc.code)) return res.status(409).json({ ok:false, error:"CODE_EXISTS" });
-      memory.promoCodes.unshift(doc);
-      scheduleSave();
-    }
-    res.json({ ok:true, code: doc.code, promo: doc });
-  } catch (e) {
-    if (e?.code === 11000) return res.status(409).json({ ok:false, error:"CODE_EXISTS" });
-    console.error("[promo/create]", e);
-    res.status(500).json({ ok:false, error:"SERVER" });
-  }
-});
-
-app.post("/api/admin/promo/generate", verifyAdminToken, async (req, res) => {
-  try {
-    let { prefix = "L3Z", amount, count, maxRedemptions=1, perUserLimit=1, expiresAt=null, notes="" } = req.body || {};
-    amount = Number(amount);
-    count = Math.min(5000, Number(count || 1));
-    if (!PROMO_ALLOWED_AMOUNTS.has(amount)) return res.status(400).json({ ok:false, error:"INVALID_AMOUNT" });
-    if (count < 1) return res.status(400).json({ ok:false, error:"COUNT_INVALID" });
-
-    const now = new Date();
-    const mkCode = () => `${normCode(prefix)}-${amount}-${crypto.randomBytes(6).toString("base64").replace(/[^A-Z0-9]/gi,"").slice(0,7).toUpperCase()}`;
-
-    if (globalThis.__dbReady) {
-      const pc = globalThis.__db.collection("promo_codes");
-      const docs = Array.from({ length: count }).map(() => ({
-        code: mkCode(),
-        amount,
-        maxRedemptions: Number(maxRedemptions),
-        perUserLimit: Number(perUserLimit),
-        redeemedCount: 0,
-        active: true,
-        expiresAt: expiresAt ? new Date(expiresAt) : null,
-        createdBy: req.adminUser || "admin",
-        notes: String(notes || ""),
-        createdAt: now,
-        updatedAt: now,
-      }));
-      await pc.insertMany(docs, { ordered: false });
-      return res.json({ ok:true, generated: docs.length, sample: docs.slice(0,5).map(d=>d.code) });
-    } else {
-      const docs = [];
-      for (let i=0;i<count;i++){
-        let c; do { c = mkCode(); } while ((memory.promoCodes||[]).some(p => p.code === c));
-        docs.push({
-          code: c, amount,
-          maxRedemptions: Number(maxRedemptions),
-          perUserLimit: Number(perUserLimit),
-          redeemedCount: 0,
-          active: true,
-          expiresAt: expiresAt ? new Date(expiresAt) : null,
-          createdBy: req.adminUser || "admin",
-          notes: String(notes || ""),
-          createdAt: now,
-          updatedAt: now,
-        });
-      }
-      memory.promoCodes = [...docs, ...(memory.promoCodes||[])];
-      scheduleSave();
-      return res.json({ ok:true, generated: docs.length, sample: docs.slice(0,5).map(d=>d.code) });
-    }
-  } catch (e) {
-    console.error("[promo/generate]", e);
-    res.status(500).json({ ok:false, error:"SERVER" });
-  }
-});
-
-// List / disable
-app.get("/api/admin/promo/list", verifyAdminToken, async (req, res) => {
-  const only = "active" in req.query ? (req.query.active === "1") : null;
-  if (globalThis.__dbReady) {
-    const q = only === null ? {} : { active: only };
-    const items = await globalThis.__db.collection("promo_codes").find(q).sort({ createdAt: -1 }).limit(500).toArray();
-    return res.json({ ok:true, items });
-  } else {
-    let items = [...(memory.promoCodes||[])];
-    if (only !== null) items = items.filter(p => !!p.active === only);
-    return res.json({ ok:true, items });
-  }
-});
-app.post("/api/admin/promo/disable", verifyAdminToken, async (req, res) => {
-  const code = normCode(req.body?.code || "");
-  if (!code) return res.status(400).json({ ok:false, error:"CODE_REQUIRED" });
-  if (globalThis.__dbReady) {
-    const r = await globalThis.__db.collection("promo_codes").updateOne({ code }, { $set: { active:false, updatedAt: new Date() } });
-    return res.json({ ok:true, modified: r.modifiedCount });
-  } else {
-    const i = (memory.promoCodes||[]).findIndex(p => p.code === code);
-    if (i >= 0) memory.promoCodes[i].active = false;
-    scheduleSave();
-    return res.json({ ok:true, modified: i >= 0 ? 1 : 0 });
-  }
-});
-
-/* ===================== LBX PROMO CODES — USER ===================== */
-app.post("/api/promo/redeem", requireViewer, tinyRateLimit(), async (req, res) => {
-  try {
-    const code = normCode(req.body?.code || "");
-    if (!code) return res.status(400).json({ ok:false, error:"CODE_REQUIRED" });
-    const username = req.viewer;
-
-    const now = new Date();
-
-    if (globalThis.__dbReady) {
-      const pc = globalThis.__db.collection("promo_codes");
-      const pr = globalThis.__db.collection("promo_redemptions");
-
-      const promo = await pc.findOne({ code });
-      if (!promo || !promo.active) return res.status(404).json({ ok:false, error:"INVALID_CODE" });
-      if (promo.expiresAt && promo.expiresAt < now) return res.status(410).json({ ok:false, error:"EXPIRED" });
-      if (promo.redeemedCount >= promo.maxRedemptions) return res.status(409).json({ ok:false, error:"DEPLETED" });
-
-      const prior = await pr.countDocuments({ code, username });
-      if (prior >= (promo.perUserLimit || 1)) return res.status(409).json({ ok:false, error:"PER_USER_LIMIT" });
-
-      try {
-        await pr.insertOne({ code, username, amount: Number(promo.amount||0), createdAt: now });
-      } catch {
-        return res.status(409).json({ ok:false, error:"ALREADY_REDEEMED" });
-      }
-
-      const up = await pc.updateOne(
-        { _id: promo._id, redeemedCount: { $lt: promo.maxRedemptions } },
-        { $inc: { redeemedCount: 1 }, $set: { updatedAt: now } }
-      );
-      if (up.modifiedCount !== 1) {
-        await pr.deleteOne({ code, username }); // rollback
-        return res.status(409).json({ ok:false, error:"DEPLETED" });
-      }
-
-      const credited = await adjustWallet(username, Number(promo.amount||0), `promo:${code}`);
-      if (!credited?.ok) {
-        await pc.updateOne({ _id: promo._id }, { $inc: { redeemedCount: -1 } });
-        await pr.deleteOne({ code, username });
-        return res.status(500).json({ ok:false, error:"CREDIT_FAILED" });
-      }
-
-      return res.json({ ok:true, added: Number(promo.amount||0), code, balance: credited.balance });
-    }
-
-    // ===== FILE/MEMORY MODE =====
-    const promo = (memory.promoCodes||[]).find(p => p.code === code);
-    if (!promo || !promo.active) return res.status(404).json({ ok:false, error:"INVALID_CODE" });
-    if (promo.expiresAt && promo.expiresAt < now) return res.status(410).json({ ok:false, error:"EXPIRED" });
-
-    if (promo.redeemedCount >= promo.maxRedemptions) return res.status(409).json({ ok:false, error:"DEPLETED" });
-
-    const userClaims = (memory.promoRedemptions||[]).filter(r => r.code === code && r.username === username).length;
-    if (userClaims >= (promo.perUserLimit || 1)) return res.status(409).json({ ok:false, error:"PER_USER_LIMIT" });
-
-    // reserve
-    promo.redeemedCount++;
-    memory.promoRedemptions.unshift({ code, username, amount: Number(promo.amount||0), createdAt: now });
-
-    const credited = await adjustWallet(username, Number(promo.amount||0), `promo:${code}`);
-    if (!credited?.ok) {
-      promo.redeemedCount = Math.max(0, promo.redeemedCount - 1);
-      memory.promoRedemptions = (memory.promoRedemptions||[]).filter(r => !(r.code === code && r.username === username));
-      scheduleSave();
-      return res.status(500).json({ ok:false, error:"CREDIT_FAILED" });
-    }
-    scheduleSave();
-    return res.json({ ok:true, added: Number(promo.amount||0), code, balance: credited.balance });
-  } catch (e) {
-    console.error("[promo/redeem]", e);
-    res.status(500).json({ ok:false, error:"SERVER" });
-  }
-});
-
-app.get("/api/promo/my-redemptions", requireViewer, async (req, res) => {
-  const username = req.viewer;
-  if (globalThis.__dbReady) {
-    const rows = await globalThis.__db.collection("promo_redemptions")
-      .find({ username }).sort({ createdAt: -1 }).limit(200).toArray();
-    return res.json({ ok:true, items: rows });
-  } else {
-    const rows = (memory.promoRedemptions||[]).filter(r => r.username === username);
-    return res.json({ ok:true, items: rows });
-  }
-});
 
 /* ===================== Leaderboard (monthly + lifetime) ===================== */
 app.post("/api/leaderboard/upsert", verifyAdminToken, async (req, res) => {
@@ -2035,4 +1953,3 @@ app.listen(PORT, HOST, () => {
     }
   }
 })();
-
