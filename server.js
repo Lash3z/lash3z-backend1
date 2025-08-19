@@ -1,5 +1,8 @@
 // server.js — full ESM build (TOTAL ROUNDS BANDS from Battleground; Bets drafts/publish)
 // + Wallet persistence (Mongo or memory) and one-time SIGNUP_BONUS
+// + Monthly leaderboard buckets that auto "reset" without touching lifetime totals
+// + NEW: Durable disk-persistence fallback when Mongo is not available (prevents balance/points loss on restart)
+
 import fs from "fs";
 import path from "path";
 import express from "express";
@@ -30,6 +33,10 @@ const MONGO_URI = process.env.MONGO_URI || "";
 const MONGO_DB  = process.env.MONGO_DB  || "lash3z";
 const ALLOW_MEMORY_FALLBACK = (process.env.ALLOW_MEMORY_FALLBACK || "true") === "true";
 
+// NEW: Disk persistence fallback when running without Mongo
+const ENABLE_DISK_PERSISTENCE = (process.env.STATE_PERSIST ?? "true") === "true";
+const STATE_FILE = process.env.STATE_FILE || path.join(process.cwd(), ".data", "state.json");
+
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s=>s.trim()).filter(Boolean);
 
@@ -38,7 +45,8 @@ const SIGNUP_BONUS = Number(process.env.SIGNUP_BONUS || 0);
 /* ===== Kick OAuth ENV ===== */
 const KICK_OAUTH_AUTHORIZE = "https://id.kick.com/oauth/authorize";
 const KICK_OAUTH_TOKEN     = "https://id.kick.com/oauth/token";
-const KICK_API_BASE        = "https://api.kick.com/public/v1";
+// UPDATED: use the stable current-user endpoint
+const KICK_USER_URL        = "https://kick.com/api/v1/user";
 const KICK_CLIENT_ID       = process.env.KICK_CLIENT_ID || "";
 const KICK_CLIENT_SECRET   = process.env.KICK_CLIENT_SECRET || "";
 const KICK_REDIRECT_URI    = process.env.KICK_REDIRECT_URI || "https://lash3z.com/auth/kick/callback";
@@ -77,7 +85,7 @@ const ADMIN_HUB_FILE = resolveFirstExisting([
   "admin/admin_hub.html",
 ]);
 
-/* ===================== Memory ===================== */
+/* ===================== Memory (with disk persist fallback) ===================== */
 const memory = {
   jackpot: { amount: 0, month: new Date().toISOString().slice(0,7), perSubAUD: 2.5 },
   rules: {
@@ -86,12 +94,12 @@ const memory = {
     jackpotPerSubAUD: 2.50, jackpotCurrency: "AUD", depositContributesJackpot: false
   },
   events: [],
-  wallets: {},        // legacy in-memory wallets (used if DB is unavailable)
+  wallets: {},        // persistent when Mongo or disk persist
   users: new Map(),   // in-memory users (only if DB is unavailable)
   raffles: [],
   claims: [],
   deposits: [],
-  profiles: {},
+  profiles: {},       // lifetime cumulative points (disk-persist in memory mode)
   pvpEntries: [],
   pvpBracket: null,
   live: { pvp: null, battleground: null, bonus: null },
@@ -110,6 +118,76 @@ const memory = {
   // Monthly leaderboard buckets (memory fallback)
   monthlyLB: {}   // { "YYYY-MM": { USER: { ...points } } }
 };
+
+// ---- Disk persistence helpers (only used when Mongo is not ready) ----
+function deepMerge(target, src) {
+  if (!src || typeof src !== "object") return target;
+  for (const k of Object.keys(src)) {
+    const v = src[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      if (!target[k] || typeof target[k] !== "object" || Array.isArray(target[k])) target[k] = {};
+      deepMerge(target[k], v);
+    } else {
+      target[k] = v;
+    }
+  }
+  return target;
+}
+function ensureDir(p){ try{ fs.mkdirSync(p, { recursive: true }); }catch{} }
+const stateDir = path.dirname(STATE_FILE);
+ensureDir(stateDir);
+
+let __saveTimer = null;
+function scheduleSave() {
+  if (globalThis.__dbReady) return;               // Mongo active → don't use disk fallback
+  if (!ENABLE_DISK_PERSISTENCE) return;
+  clearTimeout(__saveTimer);
+  __saveTimer = setTimeout(() => {
+    try {
+      const tmp = STATE_FILE + ".tmp";
+      const payload = JSON.stringify({
+        wallets: memory.wallets,
+        profiles: memory.profiles,
+        monthlyLB: memory.monthlyLB,
+        promoCodes: memory.promoCodes,
+        promoRedemptions: memory.promoRedemptions,
+        pvpEntries: memory.pvpEntries,
+        raffles: memory.raffles,
+        claims: memory.claims,
+        deposits: memory.deposits,
+        live: memory.live,
+        flags: memory.flags,
+        ts: Date.now(),
+        version: 1
+      }, null, 2);
+      fs.writeFileSync(tmp, payload);
+      fs.renameSync(tmp, STATE_FILE); // atomic swap
+    } catch (e) {
+      console.warn("[PERSIST] save failed:", e?.message || e);
+    }
+  }, 250);
+}
+function loadFromDisk() {
+  if (!ENABLE_DISK_PERSISTENCE) return false;
+  try {
+    if (!existsSync(STATE_FILE)) return false;
+    const raw = fs.readFileSync(STATE_FILE, "utf8");
+    const saved = JSON.parse(raw);
+    deepMerge(memory, saved);
+    console.log(`[PERSIST] State loaded from ${STATE_FILE}`);
+    return true;
+  } catch (e) {
+    console.warn("[PERSIST] load failed:", e?.message || e);
+    return false;
+  }
+}
+loadFromDisk();
+// save on exit
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => {
+    try { scheduleSave(); setTimeout(()=>process.exit(0), 150); } catch { process.exit(0); }
+  });
+}
 
 /* ===================== App ===================== */
 const app = express();
@@ -218,12 +296,14 @@ app.get(["/api/admin/gate/check", "/api/admin/me"], verifyAdminToken, (req, res)
 
 /* ===================== Health/Home/Admin pages ===================== */
 app.get("/api/health", (req, res) => {
+  const storageMode = globalThis.__dbReady ? "mongo" : (existsSync(STATE_FILE) ? "disk" : "memory");
   res.json({
     ok: true, env: NODE_ENV, port: PORT,
     publicDir: PUBLIC_DIR, homeIndex: HOME_INDEX, hasHome: HAS_HOME,
     adminLoginFile: ADMIN_LOGIN_FILE, hasAdminLogin: !!ADMIN_LOGIN_FILE,
     adminHubFile: ADMIN_HUB_FILE, hasAdminHub: !!ADMIN_HUB_FILE,
     db: !!globalThis.__dbReady,
+    storageMode,
     adminBypass: DISABLE_ADMIN_AUTH,
     kick: {
       configured: !!(KICK_CLIENT_ID && KICK_CLIENT_SECRET && KICK_REDIRECT_URI),
@@ -341,9 +421,10 @@ async function getWallet(username) {
     return { username: user, balance: 0, signupBonusGrantedAt: null };
   }
 
-  // memory
+  // memory (disk persisted)
   const w = memory.wallets[user] || { balance: 0, signupBonusGrantedAt: null, ledger: [] };
   memory.wallets[user] = w;
+  scheduleSave();
   return { username: user, balance: Number(w.balance || 0), signupBonusGrantedAt: w.signupBonusGrantedAt };
 }
 
@@ -368,11 +449,12 @@ async function adjustWallet(username, delta, reason = "adjust") {
     return { ok: true, balance: Number(r.value?.balance || 0) };
   }
 
-  // memory
+  // memory (disk persisted)
   const w = memory.wallets[user] || { balance: 0, ledger: [], signupBonusGrantedAt: null };
   w.balance = Number(w.balance || 0) + amount;
   w.ledger.push({ ts: nowISO(), delta: amount, reason });
   memory.wallets[user] = w;
+  scheduleSave();
   return { ok: true, balance: w.balance };
 }
 
@@ -402,13 +484,14 @@ async function grantSignupBonusIfNeeded(username) {
     return { ok: true, balance: Number(r.value?.balance || 0) };
   }
 
-  // memory
+  // memory (disk persisted)
   const w = memory.wallets[user] || { balance: 0, ledger: [], signupBonusGrantedAt: null };
   if (w.signupBonusGrantedAt) return { ok: true, skipped: true, balance: Number(w.balance || 0) };
   w.balance = Number(w.balance || 0) + bonus;
   w.signupBonusGrantedAt = new Date();
   w.ledger.push({ ts: nowISO(), delta: bonus, reason: "signup_bonus" });
   memory.wallets[user] = w;
+  scheduleSave();
   return { ok: true, balance: w.balance };
 }
 
@@ -428,6 +511,7 @@ async function userCreate(username, passHash) {
     await globalThis.__db.collection("users").insertOne(doc);
   } else {
     memory.users.set(u, doc);
+    scheduleSave();
   }
   return doc;
 }
@@ -586,6 +670,7 @@ async function saveKickLink(username, profile /*, tokens */) {
     const existing = memory.users.get(u) || { username: u, createdAt: new Date() };
     existing.kick = { id: profile.id, username: profile.username, linkedAt: new Date() };
     memory.users.set(u, existing);
+    scheduleSave();
   }
 }
 
@@ -608,6 +693,7 @@ async function clearKickLink(username) {
   } else {
     const doc = memory.users.get(u);
     if (doc) delete doc.kick;
+    scheduleSave();
   }
 }
 
@@ -634,7 +720,7 @@ app.get("/auth/kick", requireViewer, (req, res) => {
   res.redirect(url.toString());
 });
 
-// OAuth callback
+// OAuth callback (updated endpoint + debug logging + fallback)
 app.get("/auth/kick/callback", async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query;
@@ -659,17 +745,53 @@ app.get("/auth/kick/callback", async (req, res) => {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body
     });
-    const tokens = await tokRes.json();
+    const tokens = await tokRes.json().catch(() => ({}));
     if (!tokRes.ok || !tokens?.access_token) {
+      console.error("[Kick OAuth] token exchange failed:", tokRes.status, tokens);
       return res.redirect(`/profile?kickError=token_exchange_failed`);
     }
+    console.log("[Kick OAuth] token ok len:", String(tokens.access_token || "").length);
 
-    // Fetch current user profile from Kick
-    const meRes = await fetch(`${KICK_API_BASE}/users/me`, {
-      headers: { Authorization: `Bearer ${tokens.access_token}` }
-    });
-    const profile = await meRes.json();
-    if (!meRes.ok || !profile?.id) {
+    // Fetch current user profile from Kick (v1)
+    let profile = null;
+    try {
+      const meRes = await fetch(KICK_USER_URL, {
+        headers: { Authorization: `Bearer ${tokens.access_token}` }
+      });
+      const j = await meRes.json().catch(() => ({}));
+      if (!meRes.ok) {
+        console.error("[Kick OAuth] v1 /user fetch bad:", meRes.status, j);
+      } else {
+        profile = {
+          id: j?.id ?? j?.data?.id ?? j?.user?.id,
+          username: (j?.username ?? j?.data?.username ?? j?.user?.username ?? "").toString()
+        };
+      }
+    } catch (e) {
+      console.error("[Kick OAuth] v1 /user threw:", e);
+    }
+
+    // Fallback to v2 if needed
+    if (!profile?.id) {
+      try {
+        const alt = await fetch("https://kick.com/api/v2/user", {
+          headers: { Authorization: `Bearer ${tokens.access_token}` }
+        });
+        const jj = await alt.json().catch(() => ({}));
+        if (alt.ok) {
+          profile = {
+            id: jj?.id ?? jj?.data?.id ?? jj?.user?.id,
+            username: (jj?.username ?? jj?.data?.username ?? jj?.user?.username ?? "").toString()
+          };
+        } else {
+          console.error("[Kick OAuth] v2 /user fetch bad:", alt.status, jj);
+        }
+      } catch (e) {
+        console.error("[Kick OAuth] v2 /user threw:", e);
+      }
+    }
+
+    if (!profile?.id) {
       return res.redirect(`/profile?kickError=user_fetch_failed`);
     }
 
@@ -697,8 +819,8 @@ app.post("/api/kick/unlink", requireViewer, async (req, res) => {
 
 /* ===================== Deposits / Orders ===================== */
 app.get("/api/deposits/pending", verifyAdminToken, (req, res) => res.json({ orders: memory.deposits }));
-app.post("/api/deposits/:id/approve", verifyAdminToken, (req, res) => { const id = String(req.params.id); memory.deposits = memory.deposits.filter(o => String(o.id||o._id) !== id); res.json({ success: true }); });
-app.post("/api/deposits/:id/reject", verifyAdminToken, (req, res) => { const id = String(req.params.id); memory.deposits = memory.deposits.filter(o => String(o.id||o._id) !== id); res.json({ success: true }); });
+app.post("/api/deposits/:id/approve", verifyAdminToken, (req, res) => { const id = String(req.params.id); memory.deposits = memory.deposits.filter(o => String(o.id||o._id) !== id); scheduleSave(); res.json({ success: true }); });
+app.post("/api/deposits/:id/reject", verifyAdminToken, (req, res) => { const id = String(req.params.id); memory.deposits = memory.deposits.filter(o => String(o.id||o._id) !== id); scheduleSave(); res.json({ success: true }); });
 
 // accept client submit
 app.post("/api/lbx/orders", (req, res) => {
@@ -707,13 +829,14 @@ app.post("/api/lbx/orders", (req, res) => {
   o.status = "pending";
   o.ts = o.ts || Date.now();
   memory.deposits.unshift(o);
+  scheduleSave();
   res.json({ success: true, order: o });
 });
 
 /* ===================== Raffles / Giveaways (admin shims) ===================== */
 function ensureRaffle(rid){
   let r = (memory.raffles||[]).find(x => x.rid === rid);
-  if (!r) { r = { rid, title: rid, open:true, createdAt: Date.now(), entries: [], winner:null }; memory.raffles.unshift(r); }
+  if (!r) { r = { rid, title: rid, open:true, createdAt: Date.now(), entries: [], winner:null }; memory.raffles.unshift(r); scheduleSave(); }
   return r;
 }
 app.get("/api/admin/raffles/:rid/entries", verifyAdminToken, (req,res)=>{
@@ -725,6 +848,7 @@ app.post("/api/admin/raffles/:rid/entries", verifyAdminToken, (req,res)=>{
   if (!user) return res.status(400).json({ error: "user required" });
   const r = ensureRaffle(rid); r.entries = r.entries || [];
   if (!r.entries.some(e => String(e.user).toUpperCase()===user)) r.entries.push({ user, ts: Date.now() });
+  scheduleSave();
   res.json({ success:true });
 });
 app.get("/api/admin/giveaways/:gid/entries", verifyAdminToken, (req,res)=>{
@@ -736,6 +860,7 @@ app.post("/api/admin/giveaways/:gid/entries", verifyAdminToken, (req,res)=>{
   if (!user) return res.status(400).json({ error: "user required" });
   const r = ensureRaffle(rid); r.entries = r.entries || [];
   if (!r.entries.some(e => String(e.user).toUpperCase()===user)) r.entries.push({ user, ts: Date.now() });
+  scheduleSave();
   res.json({ success:true });
 });
 
@@ -753,6 +878,7 @@ app.post("/api/prize-claims", (req, res) => {
   };
   if (!claim.user) return res.status(400).json({ error: "user required" });
   memory.claims.unshift(claim);
+  scheduleSave();
   res.json({ success: true, claim });
 });
 app.get("/api/prize-claims", verifyAdminToken, (req, res) => {
@@ -768,6 +894,7 @@ app.post("/api/prize-claims/:id/status", verifyAdminToken, (req, res) => {
   const i = (memory.claims || []).findIndex(c => String(c._id) === id);
   if (i < 0) return res.json({ success: false });
   memory.claims[i].status = status;
+  scheduleSave();
   res.json({ success: true });
 });
 
@@ -860,7 +987,7 @@ app.post("/api/leaderboard/upsert", verifyAdminToken, async (req, res) => {
         }
       });
     } else {
-      // ===== Memory fallback =====
+      // ===== Memory fallback (disk persisted) =====
       // cumulative
       const p = memory.profiles[user] || {
         username: user,
@@ -891,6 +1018,7 @@ app.post("/api/leaderboard/upsert", verifyAdminToken, async (req, res) => {
       mrec.history.unshift({ ts: Date.now(), mode, added: delta, actions });
       memory.monthlyLB[month][user] = mrec;
 
+      scheduleSave();
       return res.json({
         success: true,
         cumulative: {
@@ -1051,6 +1179,7 @@ app.get("/api/pvp/entries/open", (req,res)=>{
 app.post("/api/admin/pvp/entries/open", verifyAdminToken, (req,res)=>{
   const open = !!req.body?.open;
   memory.flags.pvpEntriesOpen = open;
+  scheduleSave();
   res.json({ success:true, open });
 });
 
@@ -1077,6 +1206,7 @@ app.post("/api/pvp/entries", async (req, res) => {
       if (exists) return res.status(409).json({ error: "duplicate", entry: exists });
       const saved = { _id: String(Date.now()), ...doc };
       memory.pvpEntries.push(saved);
+      scheduleSave();
       return res.json({ success: true, entry: saved });
     }
   } catch (e) {
@@ -1113,6 +1243,7 @@ app.post("/api/pvp/entries/:id/status", verifyAdminToken, async (req, res) => {
       const i = memory.pvpEntries.findIndex(e => e._id === id || e.username === id.toUpperCase());
       if (i < 0) return res.json({ success: false });
       memory.pvpEntries[i].status = status;
+      scheduleSave();
       return res.json({ success: true });
     }
   } catch (e) {
@@ -1132,6 +1263,7 @@ app.delete("/api/pvp/entries/:id", verifyAdminToken, async (req, res) => {
       const id = req.params.id;
       const before = memory.pvpEntries.length;
       memory.pvpEntries = memory.pvpEntries.filter(e => e._id !== id && e.username !== id.toUpperCase());
+      scheduleSave();
       return res.json({ success: memory.pvpEntries.length !== before });
     }
   } catch (e) {
@@ -1178,6 +1310,7 @@ async function saveBracket(builder){
     await col.updateOne({ _id: "active" }, { $set: { builder } }, { upsert: true });
   } else {
     memory.pvpBracket = builder;
+    scheduleSave();
   }
   memory.live.pvp = builder;
   return builder;
@@ -1337,6 +1470,7 @@ async function saveLiveBuilder(key, builder){
   } else {
     if (!memory.live) memory.live = {};
     memory.live[key] = builder;
+    scheduleSave();
   }
   return builder;
 }
@@ -1353,6 +1487,7 @@ app.post("/api/battleground/builder", verifyAdminToken, async (req,res)=>{
     if (m > 0){
       const bandsDraft = buildTotalRoundsBandsDraft(m);
       upsertDraft(bandsDraft);
+      scheduleSave();
     }
     res.json({ success:true, autoDraft: m>0 ? true : false });
   }catch(e){ console.error("[BG] publish failed", e); res.status(500).json({ error:"failed" }); }
@@ -1371,6 +1506,7 @@ app.post("/api/battleground/publish", verifyAdminToken, async (req, res) => {
     if (m > 0) {
       const bandsDraft = buildTotalRoundsBandsDraft(m);
       upsertDraft(bandsDraft);
+      scheduleSave();
     }
     res.json({ success: true });
   } catch (e) {
@@ -1461,6 +1597,7 @@ app.post("/api/admin/bets", verifyAdminToken, (req,res)=>{
     ts: Date.now()
   };
   upsertDraft(evt);
+  scheduleSave();
   res.json({ ok:true, id });
 });
 
@@ -1482,6 +1619,7 @@ app.post("/api/admin/bets/publish", verifyAdminToken, (req,res)=>{
       memory.betsPublished = [evt, ...memory.betsPublished.filter(x => (x.eventId||x.id)!==(evt.eventId||evt.id))];
     });
     memory.betsDrafts = memory.betsDrafts.filter(x => !moving.includes(x));
+    scheduleSave();
     return res.json({ ok:true, published: moving.length });
   } else {
     const i = memory.betsDrafts.findIndex(x => (x.eventId||x.id)===id);
@@ -1489,6 +1627,7 @@ app.post("/api/admin/bets/publish", verifyAdminToken, (req,res)=>{
     const evt = memory.betsDrafts[i];
     memory.betsDrafts.splice(i,1);
     memory.betsPublished = [evt, ...memory.betsPublished.filter(x => (x.eventId||x.id)!==(evt.eventId||evt.id))];
+    scheduleSave();
     return res.json({ ok:true, id: (evt.eventId||evt.id) });
   }
 });
@@ -1510,6 +1649,7 @@ app.post("/api/bets/publish", verifyAdminToken, (req, res) => {
     });
 
     memory.betsDrafts = memory.betsDrafts.filter(x => !moving.includes(x));
+    scheduleSave();
     return res.json({ ok: true, published: moving.length });
   } else {
     const i = memory.betsDrafts.findIndex(x => (x.eventId || x.id) === id);
@@ -1520,6 +1660,7 @@ app.post("/api/bets/publish", verifyAdminToken, (req, res) => {
       evt,
       ...memory.betsPublished.filter(x => (x.eventId || x.id) !== (evt.eventId || evt.id))
     ];
+    scheduleSave();
     return res.json({ ok: true, id: (evt.eventId || evt.id) });
   }
 });
@@ -1572,6 +1713,7 @@ app.post("/api/admin/promo/create", verifyAdminToken, async (req, res) => {
     } else {
       if (memory.promoCodes.some(p => p.code === doc.code)) return res.status(409).json({ ok:false, error:"CODE_EXISTS" });
       memory.promoCodes.unshift(doc);
+      scheduleSave();
     }
     res.json({ ok:true, code: doc.code, promo: doc });
   } catch (e) {
@@ -1628,6 +1770,7 @@ app.post("/api/admin/promo/generate", verifyAdminToken, async (req, res) => {
         });
       }
       memory.promoCodes.unshift(...docs);
+      scheduleSave();
       return res.json({ ok:true, generated: docs.length, sample: docs.slice(0,5).map(d=>d.code) });
     }
   } catch (e) {
@@ -1658,6 +1801,7 @@ app.post("/api/admin/promo/disable", verifyAdminToken, async (req, res) => {
   } else {
     const i = memory.promoCodes.findIndex(p => p.code === code);
     if (i >= 0) memory.promoCodes[i].active = false;
+    scheduleSave();
     return res.json({ ok:true, modified: i >= 0 ? 1 : 0 });
   }
 });
@@ -1708,7 +1852,7 @@ app.post("/api/promo/redeem", requireViewer, tinyRateLimit(), async (req, res) =
       return res.json({ ok:true, added: Number(promo.amount||0), code, balance: credited.balance });
     }
 
-    // ===== MEMORY MODE =====
+    // ===== MEMORY MODE (disk persisted) =====
     const promo = memory.promoCodes.find(p => p.code === code);
     if (!promo || !promo.active) return res.status(404).json({ ok:false, error:"INVALID_CODE" });
     if (promo.expiresAt && promo.expiresAt < now) return res.status(410).json({ ok:false, error:"EXPIRED" });
@@ -1727,8 +1871,10 @@ app.post("/api/promo/redeem", requireViewer, tinyRateLimit(), async (req, res) =
       // rollback
       promo.redeemedCount = Math.max(0, promo.redeemedCount - 1);
       memory.promoRedemptions = memory.promoRedemptions.filter(r => !(r.code === code && r.username === username));
+      scheduleSave();
       return res.status(500).json({ ok:false, error:"CREDIT_FAILED" });
     }
+    scheduleSave();
     return res.json({ ok:true, added: Number(promo.amount||0), code, balance: credited.balance });
   } catch (e) {
     console.error("[promo/redeem]", e);
@@ -1768,7 +1914,7 @@ app.listen(PORT, HOST, () => {
 (async () => {
   if (!MONGO_URI) {
     if (!ALLOW_MEMORY_FALLBACK) console.warn("[DB] No MONGO_URI; memory mode disabled.");
-    else console.warn("[DB] No MONGO_URI; running in MEMORY MODE.");
+    else console.warn("[DB] No MONGO_URI; running in MEMORY MODE with DISK PERSIST.");
     return;
   }
   try {
@@ -1812,6 +1958,6 @@ app.listen(PORT, HOST, () => {
   } catch (err) {
     console.error("[DB] Mongo connection failed:", err?.message || err);
     if (!ALLOW_MEMORY_FALLBACK) { console.error("[DB] ALLOW_MEMORY_FALLBACK=false — exiting"); process.exit(1); }
-    console.warn("[DB] Continuing in memory mode.");
+    console.warn("[DB] Continuing in memory mode with DISK PERSIST.");
   }
 })();
